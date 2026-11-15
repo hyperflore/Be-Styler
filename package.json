@@ -1,6 +1,6 @@
 {
     "name": "be-styler",
-    "version": "2.2.1",
+    "version": "2.2.2",
     "description": "Be Styler: the Be Themer theme engine plus the theme-effect plugins. No Meow or Owlie.",
     "private": true,
     "license": "MIT",

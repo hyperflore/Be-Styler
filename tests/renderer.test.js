@@ -1,726 +1,7169 @@
-const { JSDOM } = require("jsdom");
-const fs = require("fs");
-const path = require("path");
-const ROOT = process.argv[2] || path.resolve(__dirname, "..");
-const { variantFor } = require("./variant");
-const V = variantFor(ROOT);
-const renderer = fs.readFileSync(`${ROOT}/dist/renderer.js`, "utf8");
-const theme = fs.readFileSync(`${ROOT}/themes/b-themer.theme.css`, "utf8");
-
-const results = [];
-const ok = (name, cond, extra = "") => results.push(`${cond ? "PASS" : "FAIL"}  ${name}${extra ? "  " + extra : ""}`);
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-const quickSaved = [];
-class Sheet { constructor() { this.text = ""; this.disabled = false; } replaceSync(t) { this.text = t; } }
-
-function makeWindow(html, state, url = "https://discord.com/app") {
-    const dom = new JSDOM(html, { url, runScripts: "outside-only", pretendToBeVisual: true });
-    const w = dom.window;
-    w.CSSStyleSheet = Sheet;
-    let adopted = [];
-    Object.defineProperty(w.document, "adoptedStyleSheets", { get: () => adopted, set: v => (adopted = [...v]) });
-    w.HTMLCanvasElement.prototype.getContext = () => new Proxy({}, { get: () => () => {} });
-    w.indexedDB = { open() { const r = {}; setTimeout(() => r.onerror && r.onerror()); return r; } };
-    const saved = [];
-    w.BThemerNative = {
-        setQuickCss: css => { quickSaved.push(css); return Promise.resolve(true); },
-        getState: () => state,
-        setSettings: s => { saved.push(JSON.parse(JSON.stringify(s))); return Promise.resolve(true); },
-        openPath: () => Promise.resolve(""),
-        fetchImage: () => Promise.reject(new Error("nope")),
-        reloadPlugins: () => {},
-        onThemesChanged: () => {},
-        onRendererChanged: () => {},
-    };
-    return { w, saved };
-}
-
-const sheetsTextOf = w => w.document.adoptedStyleSheets.filter(s => !s.disabled).map(s => s.text).join("\n");
-const wrap = (file, src) => `window.BThemer && window.BThemer.__withFile(${JSON.stringify("user:" + file)}, function () {\n${src}\n});`;
-
-(async () => {
-    const { w, saved } = makeWindow(
-        `<!doctype html><html><head></head><body><nav class="guilds_abc"></nav><ol><li class="messageListItem_x"><div id="message-content-1">hello anime world</div></li></ol></body></html>`,
-        { version: "test", dataDir: "X", settings: {}, quickCss: "/*q*/", themes: [{ file: "b-themer.theme.css", source: "bundled", css: theme, name: "B-Themer" }] },
-    );
-    const sheetsText = () => w.document.adoptedStyleSheets.filter(s => !s.disabled).map(s => s.text).join("\n");
-
-    w.eval(renderer);
-    const template = fs.readFileSync(`${ROOT}/templates/plugin.js`, "utf8")
-        .replaceAll("__PLUGIN_ID__", "myPlugin").replaceAll("__PLUGIN_NAME__", "My Plugin")
-        .replaceAll("__PLUGIN_AUTHOR__", "you").replaceAll("__TYPES_PATH__", "x");
-    w.eval(`window.BThemer.__syncUserPlugins(["myPlugin.js","broken.js","badstart.js"])`);
-    w.eval(wrap("myPlugin.js", template));
-    w.eval(wrap("broken.js", `throw new Error("boom on load")`));
-    w.eval(wrap("badstart.js", `BThemer.definePlugin({ id: "badStart", enabledByDefault: true, start() { throw new Error("start exploded") } })`));
-    await sleep(100);
-
-    const B = w.BThemer;
-    const list = () => Object.fromEntries(B.plugins.list().map(p => [p.id, p]));
-    let L = list();
-    ok("built-in plugins registered", ["sakuraPetals", "hideNitro", "compactServers", "keywordHighlight"].filter(id => V.hasPlugin(id)).every(id => L[id]), Object.keys(L).join(","));
-    if (V.hasPlugin("hideNitro")) ok("built-ins tagged builtin:", L.hideNitro.file === "builtin:hideNitro.js");
-    if (V.hasPlugin("sakuraPetals")) ok("petals on by default & running", L.sakuraPetals.running && !!w.document.getElementById("bt-petals"));
-    if (V.hasPlugin("hideNitro")) ok("hideNitro off by default", !L.hideNitro.running);
-    ok("user plugin registered, off by default", L.myPlugin && !L.myPlugin.running && L.myPlugin.file === "user:myPlugin.js");
-    ok("start() error captured, not running", L.badStart && !L.badStart.running && /start exploded/.test(String(L.badStart.error)));
-    if (V.featureOn("themes")) {
-        ok("theme css mounted", sheetsText().includes("--bt-theme-loaded"));
-        ok("vars sheet mounted", sheetsText().includes(":root:root"));
-        ok("voice: soundboard ring pink by default (mic ring untouched)", sheetsText().includes('[style*="--brand-500"][style*="box-shadow"] { --brand-500: #ff5fa2 !important; }') && !/:root:root \{[^}]*--status-speaking/.test(sheetsText()));
-        const rule = sel => (theme.split(sel)[1] || "").split("}")[0];
-        ok("theme: message box is hard frosted (92%+ opaque, blurred)", /background: var\(--bt-overlay-bg\) !important;\s+backdrop-filter: var\(--bt-overlay-filter\)/.test(rule('form [class*="channelTextArea_"] {')));
-        ok("theme: voice / user panel is hard frosted", /background: var\(--bt-overlay-bg\) !important;\s+backdrop-filter: var\(--bt-overlay-filter\)/.test(rule('section[class*="panels_"] {')));
-        ok("theme: overlay surface is at least 92% opaque", /--bt-overlay-bg: rgb\(var\(--bt-glass-rgb\) \/ max\(var\(--bt-glass-alpha\), 0\.92\)\)/.test(theme));
-
-    }
-    if (V.hasPlugin("hideNitro")) {
-        B.plugins.enable("hideNitro"); await sleep(20);
-        ok("enable hideNitro -> css applied", sheetsText().includes('a[href="/store"]') && list().hideNitro.running);
-        B.plugins.disable("hideNitro"); await sleep(20);
-        ok("disable hideNitro -> css removed", !sheetsText().includes('a[href="/store"]') && !list().hideNitro.running);
-
-    }
-    if (V.hasPlugin("keywordHighlight")) {
-        B.plugins.enable("keywordHighlight"); await sleep(20);
-        ok("keywordHighlight starts", list().keywordHighlight.running);
-
-    }
-    B.plugins.enable("myPlugin"); await sleep(20);
-    ok("user plugin starts", list().myPlugin.running);
-    ok("user plugin css (function of settings)", sheetsText().includes("drop-shadow(0 0 12px #ff7eb6)"));
-    ok("user plugin observe() ran", w.document.getElementById("message-content-1").dataset.seenByMyPlugin === "1");
-
-    B.open("plugins"); await sleep(30);
-    let win = w.document.getElementById("bt-window");
-    ok("settings window opens", !!win);
-    const logoImg = win.querySelector(".bt-window-title img.bt-logo");
-    ok("app logo in the window title", logoImg && /^data:image\/png;base64,iVBOR/.test(logoImg.getAttribute("src")));
-    const tab = page => win.querySelector(`.bt-tab[data-page="${page}"]`);
-    const TITLES = [...win.querySelectorAll(".bt-tab")].map(t => t.textContent);
-    if (V.featureOn("themes")) ok("window has page tabs", [...win.querySelectorAll(".bt-tab")].map(t => t.dataset.page).join(",") === ["general", "theme", "servers", "maker", "plugins", ...(V.featureOn("meow") ? ["meow"] : []), ...(V.featureOn("owlie") ? ["owlie"] : []), "splash", "quickcss"].join(","));
-    ok("plugins tab is active", win.querySelector(".bt-tab-active").dataset.page === "plugins" && !win.querySelector('input[data-k="accent"]'));
-    const pluginNames = [...win.querySelectorAll(".bt-plugins-list b")].map(b => b.textContent);
-    ok("panel lists plugins", pluginNames.includes("My Plugin") && (!V.hasPlugin("sakuraPetals") || pluginNames.includes("Sakura Petals")), pluginNames.join(" | "));
-    ok("panel shows load failure for broken.js", win.textContent.includes("boom on load"));
-    ok("panel shows start error", win.textContent.includes("start exploded"));
-    const strength = win.querySelector('.bt-plugins-list input[data-k="strength"]');
-    ok("plugin setting control rendered", !!strength);
-    strength.value = "30";
-    strength.dispatchEvent(new w.Event("input")); await sleep(20);
-    ok("plugin setting change re-renders css", sheetsText().includes("drop-shadow(0 0 30px"));
-    if (V.hasPlugin("keywordHighlight")) {
-        const kw = win.querySelector('.bt-plugins-list input[data-k="keywords"]');
-        kw.value = "anime";
-        kw.dispatchEvent(new w.Event("input")); await sleep(20);
-        ok("keywordHighlight marks message on setting change", w.document.querySelector("li").hasAttribute("data-bt-keyword"));
-
+const { JSDOM } = require("jsdom");
+
+
+
+
+
+
+
+
+
+const fs = require("fs");
+
+
+
+
+
+
+
+
+
+const path = require("path");
+
+
+
+
+
+
+
+
+
+const ROOT = process.argv[2] || path.resolve(__dirname, "..");
+
+
+
+
+
+
+
+
+const { variantFor } = require("./variant");
+
+
+
+
+
+
+
+
+const V = variantFor(ROOT);
+
+
+
+
+
+
+
+
+
+const renderer = fs.readFileSync(`${ROOT}/dist/renderer.js`, "utf8");
+
+
+
+
+
+
+
+
+
+const theme = fs.readFileSync(`${ROOT}/themes/b-themer.theme.css`, "utf8");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const results = [];
+
+
+
+
+
+
+
+
+
+const ok = (name, cond, extra = "") => results.push(`${cond ? "PASS" : "FAIL"}  ${name}${extra ? "  " + extra : ""}`);
+
+
+
+
+
+
+
+
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const quickSaved = [];
+
+
+
+
+
+
+
+
+
+class Sheet { constructor() { this.text = ""; this.disabled = false; } replaceSync(t) { this.text = t; } }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function makeWindow(html, state, url = "https://discord.com/app") {
+
+
+
+
+
+
+
+
+
+    const dom = new JSDOM(html, { url, runScripts: "outside-only", pretendToBeVisual: true });
+
+
+
+
+
+
+
+
+
+    const w = dom.window;
+
+
+
+
+
+
+
+
+
+    w.CSSStyleSheet = Sheet;
+
+
+
+
+
+
+
+
+
+    let adopted = [];
+
+
+
+
+
+
+
+
+
+    Object.defineProperty(w.document, "adoptedStyleSheets", { get: () => adopted, set: v => (adopted = [...v]) });
+
+
+
+
+
+
+
+
+
+    w.HTMLCanvasElement.prototype.getContext = () => new Proxy({}, { get: () => () => {} });
+
+
+
+
+
+
+
+
+
+    w.indexedDB = { open() { const r = {}; setTimeout(() => r.onerror && r.onerror()); return r; } };
+
+
+
+
+
+
+
+
+
+    const saved = [];
+
+
+
+
+
+
+
+
+
+    w.BThemerNative = {
+
+
+
+
+
+
+
+
+
+        setQuickCss: css => { quickSaved.push(css); return Promise.resolve(true); },
+
+
+
+
+
+
+
+
+
+        getState: () => state,
+
+
+
+
+
+
+
+
+
+        setSettings: s => { saved.push(JSON.parse(JSON.stringify(s))); return Promise.resolve(true); },
+
+
+
+
+
+
+
+
+
+        openPath: () => Promise.resolve(""),
+
+
+
+
+
+
+
+
+
+        fetchImage: () => Promise.reject(new Error("nope")),
+
+
+
+
+
+
+
+
+
+        reloadPlugins: () => {},
+
+
+
+
+
+
+
+
+
+        onThemesChanged: () => {},
+
+
+
+
+
+
+
+
+
+        onRendererChanged: () => {},
+
+
+
+
+
+
+
+
+
+    };
+
+
+
+
+
+
+
+
+
+    return { w, saved };
+
+
+
+
+
+
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const sheetsTextOf = w => w.document.adoptedStyleSheets.filter(s => !s.disabled).map(s => s.text).join("\n");
+
+
+
+
+
+
+
+
+
+const wrap = (file, src) => `window.BThemer && window.BThemer.__withFile(${JSON.stringify("user:" + file)}, function () {\n${src}\n});`;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(async () => {
+
+
+
+
+
+
+
+
+
+    const { w, saved } = makeWindow(
+
+
+
+
+
+
+
+
+
+        `<!doctype html><html><head></head><body><nav class="guilds_abc"></nav><ol><li class="messageListItem_x"><div id="message-content-1">hello anime world</div></li></ol></body></html>`,
+
+
+
+
+
+
+
+
+
+        { version: "test", dataDir: "X", settings: { enabledThemes: ["b-themer.theme.css"] }, quickCss: "/*q*/", themes: [{ file: "b-themer.theme.css", source: "bundled", css: theme, name: "B-Themer" }] },
+
+
+
+
+
+
+
+
+
+    );
+
+
+
+
+
+
+
+
+
+    const sheetsText = () => w.document.adoptedStyleSheets.filter(s => !s.disabled).map(s => s.text).join("\n");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    w.eval(renderer);
+
+
+
+
+
+
+
+
+
+    const template = fs.readFileSync(`${ROOT}/templates/plugin.js`, "utf8")
+
+
+
+
+
+
+
+
+
+        .replaceAll("__PLUGIN_ID__", "myPlugin").replaceAll("__PLUGIN_NAME__", "My Plugin")
+
+
+
+
+
+
+
+
+
+        .replaceAll("__PLUGIN_AUTHOR__", "you").replaceAll("__TYPES_PATH__", "x");
+
+
+
+
+
+
+
+
+
+    w.eval(`window.BThemer.__syncUserPlugins(["myPlugin.js","broken.js","badstart.js"])`);
+
+
+
+
+
+
+
+
+
+    w.eval(wrap("myPlugin.js", template));
+
+
+
+
+
+
+
+
+
+    w.eval(wrap("broken.js", `throw new Error("boom on load")`));
+
+
+
+
+
+
+
+
+
+    w.eval(wrap("badstart.js", `BThemer.definePlugin({ id: "badStart", enabledByDefault: true, start() { throw new Error("start exploded") } })`));
+
+
+
+
+
+
+
+
+
+    await sleep(100);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    const B = w.BThemer;
+
+
+
+
+
+
+
+
+
+    const list = () => Object.fromEntries(B.plugins.list().map(p => [p.id, p]));
+
+
+
+
+
+
+
+
+
+    let L = list();
+
+
+
+
+
+
+
+
+
+    ok("built-in plugins registered", ["sakuraPetals", "hideNitro", "compactServers", "keywordHighlight"].filter(id => V.hasPlugin(id)).every(id => L[id]), Object.keys(L).join(","));
+
+
+
+
+
+
+
+
+
+    if (V.hasPlugin("hideNitro")) ok("built-ins tagged builtin:", L.hideNitro.file === "builtin:hideNitro.js");
+
+
+
+
+
+
+
+
+
+    if (V.hasPlugin("sakuraPetals")) ok("petals on by default & running", L.sakuraPetals.running && !!w.document.getElementById("bt-petals"));
+
+
+
+
+
+
+
+
+
+    if (V.hasPlugin("hideNitro")) ok("hideNitro off by default", !L.hideNitro.running);
+
+
+
+
+
+
+
+
+
+    ok("user plugin registered, off by default", L.myPlugin && !L.myPlugin.running && L.myPlugin.file === "user:myPlugin.js");
+
+
+
+
+
+
+
+
+
+    ok("start() error captured, not running", L.badStart && !L.badStart.running && /start exploded/.test(String(L.badStart.error)));
+
+
+
+
+
+
+
+
+
+    if (V.featureOn("themes")) {
+
+
+
+
+
+
+        ok("theme css mounted", sheetsText().includes("--bt-theme-loaded"));
+
+
+
+
+
+
+
+
+
+        ok("vars sheet mounted", sheetsText().includes(":root:root"));
+
+
+
+
+
+
+
+
+
+        ok("voice: soundboard ring pink by default (mic ring untouched)", sheetsText().includes('[style*="--brand-500"][style*="box-shadow"] { --brand-500: #ff5fa2 !important; }') && !/:root:root \{[^}]*--status-speaking/.test(sheetsText()));
+
+
+
+
+
+
+
+
+
+        const rule = sel => (theme.split(sel)[1] || "").split("}")[0];
+
+
+
+
+
+
+
+
+
+        ok("theme: message box is hard frosted (92%+ opaque, blurred)", /background: var\(--bt-overlay-bg\) !important;\s+backdrop-filter: var\(--bt-overlay-filter\)/.test(rule('form [class*="channelTextArea_"] {')));
+
+
+
+
+
+
+
+
+
+        ok("theme: voice / user panel is hard frosted", /background: var\(--bt-overlay-bg\) !important;\s+backdrop-filter: var\(--bt-overlay-filter\)/.test(rule('section[class*="panels_"] {')));
+
+
+
+
+
+
+
+
+
+        ok("theme: overlay surface is at least 92% opaque", /--bt-overlay-bg: rgb\(var\(--bt-glass-rgb\) \/ max\(var\(--bt-glass-alpha\), 0\.92\)\)/.test(theme));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     }
-    if (V.featureOn("themes") && V.featureOn("customCss")) {
-        tab("theme").click(); await sleep(20);
-        ok("switching tab shows the appearance page", !!win.querySelector('input[data-k="accent"]') && !win.querySelector(".bt-plugins-list"));
-
-        tab("quickcss").click(); await sleep(20);
-        const editor = win.querySelector("textarea.bt-quickcss");
-        ok("QuickCSS editor shows file contents", editor && editor.value === "/*q*/");
-        editor.value = "body { --qc-test: 1; }";
-        editor.dispatchEvent(new w.Event("input")); await sleep(500);
-        ok("QuickCSS applies as you type", sheetsText().includes("--qc-test: 1"));
-        ok("QuickCSS is saved to disk", quickSaved.at(-1) === "body { --qc-test: 1; }");
-        tab("theme").click(); await sleep(20);
-
-        const accent = win.querySelector('input[data-k="accent"]');
-        accent.value = "#00ff00";
-        accent.dispatchEvent(new w.Event("input")); await sleep(60);
-        ok("core accent change -> vars", sheetsText().includes("--bt-accent: #00ff00"));
-        const ring = win.querySelector('input[data-k="soundboardRing"]');
-        ring.value = "#ff00aa";
-        ring.dispatchEvent(new w.Event("input")); await sleep(60);
-        if (V.featureOn("themes")) ok("voice: soundboard ring colour setting", sheetsText().includes("--brand-500: #ff00aa !important;"));
-
-        ok("floating 🌸 button is gone", !w.document.getElementById("bt-btn") && !w.document.getElementById("bt-menu"));
-    }
-    tab("general").click(); await sleep(20);
-    const quick = () => (win.querySelector(".bt-quick-actions") || {}).textContent || "";
-    ok("quick actions list plugin items", quick().includes("Say hi") && (!V.hasPlugin("sakuraPetals") || quick().includes("Pause / resume petals")), quick());
-    ok("quick actions: Reload Discord (for builds where Ctrl+R does nothing)", quick().includes("Reload Discord"));
-
-    w.eval(wrap("myPlugin.js", template.replace('"1.0.0"', '"1.0.1"'))); await sleep(20);
-    ok("hot reload keeps plugin running", list().myPlugin.running);
-    ok("hot reload doesn't duplicate css", (sheetsText().match(/drop-shadow\(0 0 30px/g) || []).length === 1);
-
-    B.toggle(); await sleep(30);
-    ok("voice: no ring rule while everything is off", !w.document.adoptedStyleSheets.some(s => s.text.includes('[style*="--brand-500"]')));
-    ok("toggle off stops all plugins", B.plugins.list().every(p => !p.running) && !w.document.getElementById("bt-petals"));
-    B.toggle(); await sleep(30);
-    ok("toggle on restarts enabled plugins", (!V.hasPlugin("sakuraPetals") || list().sakuraPetals.running) && list().myPlugin.running && (!V.hasPlugin("hideNitro") || !list().hideNitro.running));
-
-    w.eval(`window.BThemer.__syncUserPlugins([])`); await sleep(20);
-    ok("deleted user plugin unloads", !list().myPlugin);
-    await sleep(10);
-    ok("its quick action is removed", !quick().includes("Say hi") && (!V.hasPlugin("sakuraPetals") || quick().includes("Pause / resume petals")));
-
-    await sleep(400);
-    const last = saved.at(-1);
-    ok("settings saved incl. plugin state", last && last.plugins.myPlugin.enabled === true && last.plugins.myPlugin.settings.strength === 30 && (!V.featureOn("themes") || last.accent === "#00ff00"));
-
-    if (V.featureOn("themes")) {
-        const sv = makeWindow(
-            `<!doctype html><html><head><title>Discord | #general | Srv</title></head><body><nav class="guilds_abc"></nav></body></html>`,
-            {
-                version: "t", dataDir: "", quickCss: "",
-                themes: [{ file: "extra.css", source: "user", css: "/*extra-marker*/", name: "Extra" }, { file: "b-themer.theme.css", source: "bundled", css: theme, name: "B-Themer" }],
-                settings: { settingsVersion: 2, accent: "#aa0000", serverThemes: { 111: { name: "Srv", preset: "Ocean", background: "global", themes: [] }, 999: null } },
-            },
-            "https://discord.com/channels/111/222",
-        );
-        sv.w.eval(renderer); await sleep(80);
-        const SB = sv.w.BThemer;
-        const svText = () => sv.w.document.adoptedStyleSheets.filter(s => !s.disabled).map(s => s.text).join("\n");
-        const svVar = name => (svText().split(":root:root {")[1]?.match(new RegExp(`${name}: ([^;]+);`)) || [])[1];
-        const go = async path => { sv.w.history.pushState({}, "", path); await sleep(40); };
-        const prof = () => SB.settings.serverThemes[111];
-
-        ok("server: broken profile entries dropped", !(999 in SB.settings.serverThemes));
-        ok("server: preset profile migrated to show its gradient", prof().background === "gradient" && SB.settings.settingsVersion === 3);
-        ok("server: preset gradient + accent applied", svVar("--bt-grad-1") === "#0288d1" && svVar("--bt-accent") === "#4fc3f7", `${svVar("--bt-grad-1")} ${svVar("--bt-accent")}`);
-
-        SB.open("theme"); await sleep(30);
-        let sw = sv.w.document.getElementById("bt-window");
-        const notice = () => sw.querySelector(".bt-server-notice");
-        ok("server: Discord Theme page says this server overrides it", notice() && !notice().hidden && notice().textContent.includes("Srv"));
-        const gradToggle = sw.querySelector('input[data-k="gradEnabled"]');
-        ok("gradient: client-wide switch shown", !!gradToggle && gradToggle.checked);
-        gradToggle.checked = false;
-        gradToggle.dispatchEvent(new sv.w.Event("input")); await sleep(40);
-        ok("gradient: switch off keeps the server's own gradient", SB.settings.gradEnabled === false && svVar("--bt-grad-alpha") === "100%");
-
-        await go("/channels/@me");
-        ok("gradient: off outside the server (plain base, no animation)", svVar("--bt-grad-alpha") === "0%" && svVar("--bt-bg-animation") === "none" && svVar("--bt-accent") === "#aa0000", `${svVar("--bt-grad-alpha")} ${svVar("--bt-bg-animation")}`);
-        ok("server: notice hidden outside the server", notice().hidden);
-        await go("/channels/111/333");
-        ok("server: back in the server, its look returns", svVar("--bt-grad-alpha") === "100%" && svVar("--bt-grad-1") === "#0288d1");
-        gradToggle.checked = true;
-        gradToggle.dispatchEvent(new sv.w.Event("input")); await sleep(40);
-
-        SB.open("servers"); await sleep(30);
-        sw = sv.w.document.getElementById("bt-window");
-        const card = () => sw.querySelector('.bt-server[data-server="111"]');
-        ok("server: card for the server you're in is open", !!card() && !!card().querySelector(".bt-server-body"));
-        [...card().querySelectorAll(".bt-server-presets .bt-b")].find(b => b.textContent === "Neon").click(); await sleep(40);
-        ok("server: picking a preset changes this server live", svVar("--bt-grad-1") === "#ff2e88" && svVar("--bt-accent") === "#ff2e88" && prof().preset === "Neon");
-
-        const g1 = card().querySelector('.bt-server-rows input[data-k="grad1"]');
-        ok("server: fine-tune shows the preset's value", g1 && g1.value === "#ff2e88");
-        g1.value = "#123456";
-        g1.dispatchEvent(new sv.w.Event("input")); await sleep(40);
-        ok("server: fine-tuned glow applies live and is stored on the server", svVar("--bt-grad-1") === "#123456" && prof().grad1 === "#123456" && SB.settings.grad1 !== "#123456");
-        g1.dispatchEvent(new sv.w.Event("change", { bubbles: true })); await sleep(20);
-        const reset = [...card().querySelectorAll(".bt-server-tune .bt-b")].find(b => /Reset/.test(b.textContent));
-        ok("server: reset button appears after a change", !!reset);
-        reset.click(); await sleep(40);
-        ok("server: reset goes back to the preset", svVar("--bt-grad-1") === "#ff2e88" && !("grad1" in prof()));
-
-        const extra = [...card().querySelectorAll(".bt-server-themes label")].find(l => l.textContent === "Extra").querySelector("input");
-        extra.checked = true;
-        extra.dispatchEvent(new sv.w.Event("change")); await sleep(20);
-        const order = svText();
-        ok("server: extra theme loads after yours", order.includes("/*extra-marker*/") && order.indexOf("/*extra-marker*/") > order.indexOf("--bt-theme-loaded"));
-        await go("/channels/@me");
-        ok("server: extra theme only in that server", !svText().includes("/*extra-marker*/"));
-        await go("/channels/111/222");
-
-        const enable = card().querySelector(".bt-server-actions input");
-        enable.checked = false;
-        enable.dispatchEvent(new sv.w.Event("change")); await sleep(40);
-        ok("server: turning one server off restores your look there", svVar("--bt-accent") === "#aa0000" && !svText().includes("/*extra-marker*/") && prof().preset === "Neon");
-        card().querySelector(".bt-server-actions input").checked = true;
-        card().querySelector(".bt-server-actions input").dispatchEvent(new sv.w.Event("change")); await sleep(40);
-        ok("server: turning it back on", svVar("--bt-accent") === "#ff2e88");
-
-        const master = sw.querySelector('input[data-k="__serverThemesEnabled"]');
-        master.checked = false;
-        master.dispatchEvent(new sv.w.Event("change")); await sleep(40);
-        ok("server: master switch off disables every server look", svVar("--bt-accent") === "#aa0000" && SB.settings.serverThemesEnabled === false);
-        master.checked = true;
-        master.dispatchEvent(new sv.w.Event("change")); await sleep(40);
-        ok("server: master switch on again", svVar("--bt-accent") === "#ff2e88");
-
-        const offWarn = () => sw.querySelector(".bt-off-warn");
-        ok("everything on: no 'switched off' warning", offWarn() && offWarn().hidden);
-        SB.toggle(); await sleep(30);
-        ok("everything off: warning shown on the page", !offWarn().hidden && sv.w.document.adoptedStyleSheets.find(s => s.text.includes("--bt-theme-loaded")).disabled);
-        offWarn().querySelector("button").click(); await sleep(30);
-        SB.open("general"); await sleep(30);
-        sw = sv.w.document.getElementById("bt-window");
-        const flip = async (k, on) => {
-            const i = sw.querySelector(`input[data-k="__${k}"]`);
-            i.checked = on;
-            i.dispatchEvent(new sv.w.Event("change")); await sleep(40);
-            return i;
-        };
-        const themeOn = () => svText().includes("--bt-theme-loaded");
-        ok("switches: my theme, this server, per-server, glass, everything", ["theme", "hereLook", "serverLooks", "glass", "everything"].every(k => sw.querySelector(`input[data-k="__${k}"]`)));
-        await flip("theme", false);
-        ok("my theme off: this server keeps its look", themeOn() && svVar("--bt-accent") === "#ff2e88" && !SB.settings.enabledThemes.includes("b-themer.theme.css"));
-        await go("/channels/@me");
-        ok("my theme off: plain Discord outside it", !themeOn());
-        ok("this-server switch says to open a server", sw.querySelector(".bt-here-look").textContent.includes("Open a server"));
-        await go("/channels/111/222");
-        await flip("hereLook", false);
-        ok("this server's look off: your (switched-off) theme applies", !themeOn() && prof().enabled === false);
-        await flip("hereLook", true);
-        await flip("theme", true);
-        ok("both back on", themeOn() && svVar("--bt-accent") === "#ff2e88");
-
-        await flip("glass", false);
-        ok("liquid glass off: solid panels, no blur", svVar("--bt-glass-alpha") === "1" && svVar("--bt-glass-filter") === "none" && SB.settings.translucent === false);
-        SB.open("theme"); await sleep(30);
-        let note = sv.w.document.querySelector("#bt-window .bt-wall-glass-note");
-        ok("wallpaper: says solid panels cover it while liquid glass is off", note && !note.hidden && /cover your wallpaper/.test(note.textContent));
-        [...note.querySelectorAll(".bt-b")].find(b => b.textContent === "Turn liquid glass on").click(); await sleep(40);
-        ok("wallpaper: one click turns liquid glass back on", SB.settings.translucent === true && note.hidden && svVar("--bt-glass-alpha") === "0.38");
-        SB.settings.translucent = false;
-        SB.open("general"); await sleep(30);
-        sw = sv.w.document.getElementById("bt-window");
-        await flip("glass", true);
-        ok("liquid glass on again", svVar("--bt-glass-alpha") === "0.38" && !svVar("--bt-glass-filter"));
-        prof().translucent = false;
-        await flip("glass", true);
-        ok("a server can have its own liquid glass setting", svVar("--bt-glass-alpha") === "1");
-        delete prof().translucent;
-
-        const doc = sv.w.document;
-        const layers = doc.createElement("div");
-        layers.className = "layers_x";
-        layers.innerHTML = `<div role="list"><div class="tooltip_a"><span>Angieee</span></div><div class="tip_b">in-app tip</div></div>`;
-        const loading = doc.createElement("div");
-        loading.innerHTML = `<div class="tipTitle_c">Did you know</div><div class="tip_d">Discord tip</div>`;
-        doc.body.append(layers, loading);
-        await sleep(40);
-        ok("loading quotes: member names untouched", layers.textContent.includes("Angieee") && layers.textContent.includes("in-app tip"));
-        ok("loading quotes: loading screen tip replaced", !loading.textContent.includes("Discord tip") && loading.querySelector(".tip_d").dataset.btQuote === "1");
-
-        const rolesAttr = () => doc.documentElement.getAttribute("data-bt-roles");
-        ok("roles: off by default", rolesAttr() === null);
-        ok("roles: styles are in the UI sheet", svText().includes('html[data-bt-roles="shine"]') && svText().includes("-webkit-text-fill-color: transparent"));
-        SB.open("theme"); await sleep(30);
-        sw = sv.w.document.getElementById("bt-window");
-        const roleSel = sw.querySelector('select[data-k="roleStyle"]');
-        roleSel.value = "shine";
-        roleSel.dispatchEvent(new sv.w.Event("change")); await sleep(40);
-        ok("roles: your style applies", rolesAttr() === "shine" && SB.settings.roleStyle === "shine" && svVar("--bt-role-speed") === "4s");
-        SB.open("servers"); await sleep(30);
-        sw = sv.w.document.getElementById("bt-window");
-        const srvRole = card().querySelector('.bt-server-rows select[data-k="roleStyle"]');
-        ok("roles: server card has its own role style (showing yours until changed)", srvRole && srvRole.value === "shine");
-        srvRole.value = "holo";
-        srvRole.dispatchEvent(new sv.w.Event("change")); await sleep(40);
-        ok("roles: server's own style in that server", rolesAttr() === "holo" && prof().roleStyle === "holo" && SB.settings.roleStyle === "shine");
-        await go("/channels/@me");
-        ok("roles: your style elsewhere", rolesAttr() === "shine");
-        await go("/channels/111/222");
-        const fontSel = card().querySelector('.bt-server-rows select[data-k="font"]');
-        fontSel.value = "mono";
-        fontSel.dispatchEvent(new sv.w.Event("change")); await sleep(40);
-        [...card().querySelectorAll(".bt-server-presets .bt-b")].find(b => b.textContent === "Ocean").click(); await sleep(40);
-        ok("presets: picking one keeps the server's font and role style", prof().font === "mono" && prof().roleStyle === "holo" && svVar("--bt-grad-1") === "#0288d1");
-        ok("server card groups its settings", [...card().querySelectorAll(".bt-server-group")].map(g => g.textContent).join("|") === "Gradient|Colours and glass|Names and text");
-        SB.toggle(); await sleep(30);
-        ok("roles: off while everything is off", rolesAttr() === null);
-        SB.toggle(); await sleep(30);
-        ok("roles: back with everything on", rolesAttr() === "holo");
-        for (const k of ["roleStyle", "font"]) delete prof()[k];
-        SB.settings.roleStyle = "off";
-
-        SB.open("plugins"); await sleep(30);
-        sw = sv.w.document.getElementById("bt-window");
-        ok("pages have plain names", [...sw.querySelectorAll(".bt-tab")].map(t => t.textContent).join(",") === ["Be Themer", "Discord Theme", "Server Theme", "Theme Maker", "Plugins", ...(V.featureOn("meow") ? ["Meow"] : []), ...(V.featureOn("owlie") ? ["Owlie"] : []), "Splash", "Custom CSS"].join(","));
-        const cards = () => [...sw.querySelectorAll(".bt-plugins-list .bt-card")];
-        const search = sw.querySelector(".bt-search");
-        search.value = "petal";
-        search.dispatchEvent(new sv.w.Event("input")); await sleep(20);
-        const visible = cards().filter(c => !c.hidden).map(c => c.querySelector("b").textContent);
-        ok("plugins: search filters the list", visible.length >= 1 && visible.every(n => /petal/i.test(cards().find(c => c.querySelector("b").textContent === n).dataset.search)), visible.join(","));
-        search.value = "zzzz-nothing";
-        search.dispatchEvent(new sv.w.Event("input")); await sleep(20);
-        ok("plugins: says when nothing matches", cards().every(c => c.hidden) && sw.querySelector(".bt-no-match"));
-        search.value = "";
-        search.dispatchEvent(new sv.w.Event("input")); await sleep(20);
-        const petals = cards().find(c => c.querySelector("b").textContent === "Sakura Petals");
-        const settingsBox = petals.querySelector(".bt-plugin-settings");
-        ok("plugins: settings folded away by default", settingsBox && settingsBox.hidden);
-        [...petals.querySelectorAll(".bt-b")].find(b => b.textContent === "Settings").click(); await sleep(10);
-        ok("plugins: Settings button unfolds them", !petals.querySelector(".bt-plugin-settings").hidden);
-        ok("plugins: count shown", /\d+ plugins · \d+ on/.test(sw.querySelector(".bt-plugin-count").textContent));
-        const fxCard = () => cards().find(c => c.querySelector("b").textContent === "Screen Effects");
-        ok("plugins: a plugin that's off says so inside its settings", fxCard().querySelector(".bt-plugin-off-note") && /is off/.test(fxCard().querySelector(".bt-plugin-off-note").textContent));
-        [...fxCard().querySelectorAll(".bt-plugin-off-note .bt-b")].find(b => b.textContent === "Turn it on").click();
-        await sleep(30);
-        ok("plugins: its Turn it on button starts it", SB.plugins.list().find(p => p.id === "screenEffects").running && !fxCard().querySelector(".bt-plugin-off-note") && fxCard().querySelector(".bt-switch").checked);
-        SB.plugins.disable("screenEffects");
-        SB.open("theme"); await sleep(30);
-        sw = sv.w.document.getElementById("bt-window");
-        const scrub = sw.querySelector('input[data-k="gradIntensity"]').closest(".bt-row").querySelector(".bt-scrub");
-        const ME = (type, x, extra = {}) => new sv.w.MouseEvent(type, { bubbles: true, clientX: x, button: 0, ...extra });
-        const startI = SB.settings.gradIntensity;
-        ok("values: shown as a scrubbable number", scrub && scrub.textContent === `${startI}%` && scrub.getAttribute("role") === "spinbutton");
-        scrub.dispatchEvent(ME("pointerdown", 100)); scrub.dispatchEvent(ME("pointermove", 120)); scrub.dispatchEvent(ME("pointerup", 120)); await sleep(30);
-        ok("values: dragging right raises it", SB.settings.gradIntensity === startI + 10 && scrub.textContent === `${startI + 10}%`, String(SB.settings.gradIntensity));
-        scrub.dispatchEvent(new sv.w.KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true })); await sleep(30);
-        ok("values: Shift+arrow nudges by 10", SB.settings.gradIntensity === startI);
-        scrub.dispatchEvent(ME("pointerdown", 50)); scrub.dispatchEvent(ME("pointerup", 50));
-        ok("values: a click lets you type", scrub.getAttribute("contenteditable") === "true");
-        scrub.textContent = "500";
-        scrub.dispatchEvent(new sv.w.KeyboardEvent("keydown", { key: "Enter", bubbles: true })); await sleep(30);
-        ok("values: typed value is kept within range", SB.settings.gradIntensity === 200 && scrub.textContent === "200%" && !scrub.hasAttribute("contenteditable"));
-        ok("values: change reaches the theme", svVar("--bt-grad-alpha") === "100%" && svVar("--bt-grad-size") === "76%");
-        scrub.dispatchEvent(ME("pointerdown", 50)); scrub.dispatchEvent(ME("pointerup", 50));
-        scrub.dispatchEvent(new sv.w.KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await sleep(10);
-        ok("values: Escape cancels typing without closing the window", sv.w.document.getElementById("bt-window") && !scrub.hasAttribute("contenteditable") && SB.settings.gradIntensity === 200);
-        SB.settings.gradIntensity = startI;
-
-        const gradHead = [...sw.querySelectorAll(".bt-sec-head")].find(h => h.textContent === "Gradient");
-        gradHead.click();
-        ok("sections: twirl closes a section", gradHead.closest(".bt-sec").classList.contains("bt-collapsed") && SB.settings.uiCollapsed["theme:Gradient"] === true);
-        SB.open("theme"); await sleep(30);
-        sw = sv.w.document.getElementById("bt-window");
-        const gradSec = () => [...sw.querySelectorAll(".bt-sec-head")].find(h => h.textContent === "Gradient").closest(".bt-sec");
-        ok("sections: stays closed next time", gradSec().classList.contains("bt-collapsed"));
-        gradSec().querySelector(".bt-sec-head").click();
-        ok("sections: opens again", !gradSec().classList.contains("bt-collapsed") && !SB.settings.uiCollapsed["theme:Gradient"]);
-        ok("presets: tiles, current one marked", sw.querySelectorAll(".bt-presets .bt-preset").length === 15);
-
-        if (V.featureOn("themes")) {
-            const heads = () => [...sw.querySelectorAll(".bt-sec-head")].map(h => h.textContent);
-            ok("Discord Theme page: your look, with its own on/off and theme files", heads().join("|") === "Discord Theme|Colour presets|Wallpaper|Gradient|Glass panels|Role colours|Colours, font and shape|Messages|Voice|Theme files" && sw.querySelector('input[data-k="__theme"]') && sw.querySelector('input[data-k="__glass"]') && sw.querySelector(".bt-themes-list"), heads().join("|"));
-            const themeSw = sw.querySelector('input[data-k="__theme"]');
-            themeSw.checked = false;
-            themeSw.dispatchEvent(new sv.w.Event("change")); await sleep(30);
-            const warnEl = sw.querySelector(".bt-warn");
-            await go("/channels/@me");
-            ok("Discord Theme page: says when your theme is off", warnEl && !warnEl.hidden);
-            [...warnEl.querySelectorAll(".bt-b")].find(b => b.textContent === "Turn my theme on").click(); await sleep(30);
-            ok("Discord Theme page: its button turns your theme back on", SB.settings.enabledThemes.includes("b-themer.theme.css") && warnEl.hidden && themeSw.checked);
-            await go("/channels/111/222");
-            SB.open("servers"); await sleep(30);
-            sw = sv.w.document.getElementById("bt-window");
-            ok("Server Theme page: only the server looks", sw.querySelector(".bt-servers") && !sw.querySelector('input[data-k="gradEnabled"]') && !sw.querySelector(".bt-themes-list"));
-            ok("Be Themer page: switches, shortcuts and advanced only", (SB.open("general"), (sw = sv.w.document.getElementById("bt-window")), heads().join("|") === "On and off|Shortcuts|Advanced"), heads().join("|"));
-            SB.open("themes"); await sleep(30);
-            sw = sv.w.document.getElementById("bt-window");
-            ok("open(\"themes\") (the old name) shows the Discord Theme page", sw.querySelector(".bt-tab-active").dataset.page === "theme");
-
-            ok("settings have descriptions", sw.querySelector('input[data-k="gradEnabled"]').closest(".bt-row").querySelector(".bt-row-desc"));
-            ok("no placeholder wording in the settings", !/fairy|story|moonlit|magic|tale\b|glow script/i.test(sw.textContent), (sw.textContent.match(/.{20}(fairy|story|moonlit|magic|tale\b|glow script).{20}/i) || [])[0]);
-
-            SB.toggle(); await sleep(30);
-            ok("everything off: warning shown again", !sw.querySelector(".bt-off-warn").hidden);
-            sw.querySelector(".bt-off-warn button").click(); await sleep(30);
-            {
-                SB.open("theme"); await sleep(30);
-                const tw = sv.w.document.getElementById("bt-window");
-                ok("theme page: no hand-made section list in the page (Discord's sidebar lists the sections)", !tw.querySelector(".bt-jump") && tw.querySelectorAll(".bt-page-theme .bt-sec-head").length > 5);
-                tw.remove();
-            }
-            ok("everything off: its button turns it back on", offWarn().hidden && SB.settings.enabled === true && svText().includes("--bt-theme-loaded") && svVar("--bt-accent") === "#4fc3f7");
-
-            {
-                SB.open("maker"); await sleep(40);
-                const mw = sv.w.document.getElementById("bt-window");
-                const start = mw.querySelector(".bt-maker-start");
-                ok("maker: a Theme Maker page with a node canvas, templates and the add-node list", mw.querySelector(".bt-page-maker .bt-nodes") && [...start.options].some(o => o.value === "__starter") && [...start.options].some(o => o.value === "Ocean") && [...mw.querySelectorAll(".bt-maker-add option")].some(o => o.value === "harmony"));
-                start.value = "Ocean"; start.dispatchEvent(new sv.w.Event("change")); await sleep(30);
-                let t = SB.settings.customThemes["My Ocean"];
-                ok("maker: a preset becomes a graph (a Color node per colour → Theme Output) with the same colours", t && t.graph.nodes.filter(n => n.type === "color").length === 8 && t.graph.nodes.some(n => n.type === "output") && t.values.accent === "#4fc3f7" && t.values.gradBase === "#071a2c" && mw.querySelectorAll(".bt-node").length === 9, JSON.stringify(t && t.values));
-                const accentLink = t.graph.links.find(l => l.in === "accent");
-                const accentNode = mw.querySelector(`.bt-node[data-id="${accentLink.from}"] input[type="color"]`);
-                accentNode.value = "#ff0000"; accentNode.dispatchEvent(new sv.w.Event("input")); await sleep(20);
-                t = SB.settings.customThemes["My Ocean"];
-                ok("maker: editing a node recomputes and saves the theme", t.values.accent === "#ff0000");
-                [...mw.querySelectorAll(".bt-b")].find(b => b.textContent === "Apply to me").click(); await sleep(20);
-                ok("maker: Apply to me sets my colours", SB.settings.accent === "#ff0000" && SB.settings.makerApplied === "My Ocean" && SB.settings.gradBase === "#071a2c");
-                accentNode.value = "#00ff00"; accentNode.dispatchEvent(new sv.w.Event("input")); await sleep(20);
-                ok("maker: an applied theme updates live as you edit", SB.settings.accent === "#00ff00");
-                SB.settings.serverThemes[111].preset = "My Ocean";
-                SB.settings.serverThemes[111].accent = undefined;
-                delete SB.settings.serverThemes[111].accent;
-                await go("/channels/222/1"); await go("/channels/111/222"); await sleep(30);
-                ok("maker: a theme you made works as a server's look", svVar("--bt-accent") === "#00ff00", svVar("--bt-accent"));
-                start.value = "__starter"; start.dispatchEvent(new sv.w.Event("change")); await sleep(30);
-                const starter = SB.settings.customThemes["My theme"];
-                ok("maker: the starter derives every colour from one (Harmony node)", starter && starter.graph.nodes.some(n => n.type === "harmony") && starter.values.accent === "#ff5fa2" && starter.values.grad3 !== starter.values.grad1 && /^#[0-9a-f]{6}$/.test(starter.values.grad3));
-                mw.remove();
-                SB.open("theme"); await sleep(30);
-                const tw2 = sv.w.document.getElementById("bt-window");
-                ok("maker: your themes are in the Colour presets", [...tw2.querySelectorAll(".bt-presets .bt-preset")].some(b => b.textContent === "My Ocean"));
-                tw2.remove();
-                delete SB.settings.makerApplied;
-            }
-
-        }
-        {
-            const opened = [];
-            sv.w.BThemerNative.openExternal = url => (opened.push(url), Promise.resolve(true));
-            SB.open("general"); await sleep(30);
-            const gw = sv.w.document.getElementById("bt-window");
-            const gh = gw.querySelector(".bt-page-general .bt-gh");
-            ok("github: a round crystal button at the very top of the Be Themer page", gh && gw.querySelector(".bt-page-general").firstElementChild.classList.contains("bt-gh-wrap") && gh.querySelector("svg.bt-gh-crystal polygon") && gw.querySelector(".bt-gh-label").textContent === "GitHub");
-            gh.click(); await sleep(10);
-            ok("github: opens the repository (from package.json)", opened.length === 1 && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(opened[0]), opened.join());
-            gw.remove();
-        }
-
-        {
-            const root = sv.w.document.documentElement;
-            ok("notifications: follow your theme by default (badges, the NEW line, the new-messages bar)", SB.settings.notifAccent !== false && !root.hasAttribute("data-bt-notif") && svText().includes("html:not([data-bt-notif=\"discord\"]) [class*=\"numberBadge_\"]") && svText().includes("--divider-color: var(--bt-accent)"));
-            SB.open("theme"); await sleep(30);
-            const nw = sv.w.document.getElementById("bt-window");
-            const sw2 = nw.querySelector("[data-k=\"notifAccent\"]");
-            sw2.click(); await sleep(40);
-            ok("notifications: switched off, Discord's red is left alone", root.getAttribute("data-bt-notif") === "discord", JSON.stringify({ attr: root.getAttribute("data-bt-notif"), setting: SB.settings.notifAccent, checked: sw2.checked, hover: root.getAttribute("data-bt-hover"), enabled: SB.settings.enabled }));
-            sw2.click(); await sleep(40);
-            ok("notifications: back on follows your accent again", !root.hasAttribute("data-bt-notif"));
-            nw.remove();
-        }
-        ok("chat: the NEW line and date lines get their own gap (never through a message)", svText().includes("ol[data-list-id=\"chat-messages\"] > [class*=\"divider_\"]"));
-
-    }
-    {
-        let applied = 0;
-        const replace = Sheet.prototype.replaceSync;
-        Sheet.prototype.replaceSync = function (t) { applied++; return replace.call(this, t); };
-        w.eval(`BThemer.definePlugin({ id: "perfProbe", enabledByDefault: true, start(api) { window.__perfSheet = api.css("a { color: red; }"); } })`);
-        await sleep(30);
-        const probe = w.__perfSheet;
-        const before = applied;
-        for (let i = 0; i < 5; i++) probe.update("a { color: red; }");
-        const same = applied - before;
-        probe.update("a { color: blue; }");
-        ok("perf: the same CSS isn't re-applied; changed CSS is", probe && same === 0 && applied - before === 1, `same: ${same}, changed: ${applied - before - same}`);
-        Sheet.prototype.replaceSync = replace;
-
-        const pw = makeWindow(`<!doctype html><html><body><nav class="guilds_x"></nav></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: {} });
-        let bodyWatchers = 0;
-        const observe = pw.w.MutationObserver.prototype.observe;
-        pw.w.MutationObserver.prototype.observe = function (t, o) { if (t === pw.w.document.body && o && o.subtree) bodyWatchers++; return observe.call(this, t, o); };
-        await sleep(20);
-        pw.w.eval(renderer); await sleep(120);
-        const seen = [];
-        pw.w.BThemer.definePlugin({ id: "perfObserve", enabledByDefault: true, start(api) { api.observe(".perf-x", el => seen.push(el.id)); } });
-        await sleep(30);
-        pw.w.document.body.insertAdjacentHTML("beforeend", '<div><span class="perf-x" id="px1"></span></div>');
-        await sleep(30);
-        ok("perf: the core, menus and plugins' observe() share one page watcher (and observe still works)", bodyWatchers === 1 && seen.join() === "px1", `watchers: ${bodyWatchers}, seen: ${seen}`);
-    }
-
-    if (V.featureOn("splash")) {
-        const LOADING = '<div class="loadingWrap_x"><div class="container_x"><video data-testid="app-spinner" class="ready_x"></video><div class="tipTitle_x">Did you know</div><div class="tip_x">Discord tip</div></div></div>';
-        const sp = makeWindow(`<!doctype html><html><body><div id="app-mount">${LOADING}</div></body></html>`,
-            { version: "t", dataDir: "", quickCss: "", themes: [{ file: "b-themer.theme.css", source: "bundled", css: theme, name: "B" }], settings: { accent: "#ff1493", splashText: "Hello there | Second line" } });
-        await sleep(20);
-        sp.w.eval(renderer); await sleep(60);
-        const splashEl = () => sp.w.document.getElementById("bt-splash");
-        const host = () => sp.w.document.querySelector(".loadingWrap_x");
-        const el0 = splashEl();
-        ok("splash: in place of Discord's loading screen (inside it, not over the app)", el0 && el0.parentElement === host() && host().hasAttribute("data-bt-splash-host") && el0.dataset.style === "clyde");
-        for (let k = 0; k < 3; k++) { sp.w.document.body.append(sp.w.document.createElement("span")); await sleep(40); }
-        ok("splash: stays put (no hopping between Discord's wrappers)", splashEl() === el0 && el0.parentElement === host() && sp.w.document.querySelectorAll("[data-bt-splash-host]").length === 1);
-        ok("splash: Discord's spinner and tips are hidden while ours is there", sheetsTextOf(sp.w).includes("[data-bt-splash-host] > :not(#bt-splash) { visibility: hidden !important; }"));
-        const css = sheetsTextOf(sp.w);
-        ok("splash: no wordmark, no generic bar, ribbons or sparkles", !el0.querySelector(".bt-sp-word, .bt-sp-title, .bt-sp-bar, .bt-sp-ribbons, .bt-sp-sparks, .bt-lg") && !/Be Themer/.test(el0.textContent));
-        ok("splash: the Discord logo screen by default (no motion video any more)", el0.querySelector(".bt-k-clyde .bt-k-logo svg path") && !el0.querySelector("video, .bt-sp-logo-wrap"));
-        ok("splash: still shown when the OS asks for less motion (just standing still)", /@media \(prefers-reduced-motion: reduce\) \{\s*#bt-splash \*, #bt-splash \{ animation: none !important; \}/.test(css));
-        ok("splash: Discord's own loading screen stays solid (not see-through over the app)", el0.style.getPropertyValue("--sp-a") === "#ff1493" && css.includes("[data-bt-discord-loading] { background-color: var(--bt-grad-base, #111214) !important;"));
-        ok("splash: your own text, quietly under the logo", el0.querySelector(".bt-k .bt-k-caption").textContent === "Hello there");
-        await sleep(2950);
-        ok("splash: your lines take turns", el0.querySelector(".bt-k-caption").textContent === "Second line");
-        host().remove();
-        const nav = sp.w.document.createElement("nav");
-        nav.className = "guilds_x";
-        sp.w.document.getElementById("app-mount").append(nav);
-        await sleep(80);
-        ok("splash: gone the moment Discord's loading screen is (no extra time, nothing left over the app)", !splashEl() && !sp.w.document.documentElement.hasAttribute("data-bt-loading"));
-        sp.w.document.getElementById("app-mount").insertAdjacentHTML("beforeend", LOADING);
-        await sleep(80);
-        ok("splash: back when Discord shows its loading screen again (reconnecting)", splashEl() && splashEl().parentElement === host(), JSON.stringify({ splash: !!splashEl(), parent: splashEl() && splashEl().parentElement.className, spinner: !!sp.w.document.querySelector("video[data-testid=app-spinner]"), mount: sp.w.document.getElementById("app-mount").innerHTML.slice(0, 160) }));
-        host().remove();
-        await sleep(80);
-        ok("splash: and gone again with it", !splashEl());
-        sp.w.BThemer.open("splash"); await sleep(40);
-        const spWin = sp.w.document.getElementById("bt-window");
-        ok("splash page: ten loading screens to choose from", [...spWin.querySelectorAll('select[data-k="splashStyle"] option')].map(o => o.value).join("|") === "clyde|morph|minimal|terminal|equalizer|shapes|counter|wallpaper|media|discord");
-        ok("splash page: every setting is there (no more ribbons / sparkles / logo animation)", ["splashStyle", "splashText", "splashLogo", "splashFit", "splashDim", "splashBg", "splashFg", "splashAccent", "splashSize", "splashSpeed", "splashClydeAnim", "splashClydeLook", "splashLoader"].every(k => spWin.querySelector(`[data-k="${k}"]`)) && !["splashMin", "splashLogoAnim", "splashRibbons", "splashSparkles"].some(k => spWin.querySelector(`[data-k="${k}"]`)));
-        await sleep(10);
-        const rowShown = k => !spWin.querySelector(`[data-k="${k}"]`).closest(".bt-row").hidden;
-        ok("splash page: only the settings for the chosen screen show (Discord logo: its own, no picture options)", rowShown("splashText") && rowShown("splashBg") && rowShown("splashClydeAnim") && !rowShown("splashLogo") && !rowShown("splashSpinner") && !rowShown("splashBars"));
-        const styleSel = spWin.querySelector('select[data-k="splashStyle"]');
-        styleSel.value = "clyde"; styleSel.dispatchEvent(new sp.w.Event("change"));
-        ok("splash page: Discord logo shows its colours, size, speed, animation, look and loader", ["splashBg", "splashFg", "splashAccent", "splashSize", "splashSpeed", "splashClydeAnim", "splashClydeLook", "splashLoader"].every(rowShown) && !rowShown("splashLogo") && !rowShown("splashFit"));
-        styleSel.value = "clyde"; styleSel.dispatchEvent(new sp.w.Event("change"));
-        const splashCss = (t => t.slice(t.indexOf("/* splash: Be Themer's loading screen */"), t.indexOf("/* toasts */")))(sheetsTextOf(sp.w));
-        ok("splash: no gradients anywhere in the loading screens", splashCss.length > 2000 && !/gradient\(/.test(splashCss) && !splashCss.includes("bt-sp-blob"));
-        Object.assign(sp.w.BThemer.settings, { splashText: "" });
-        [...spWin.querySelectorAll(".bt-b")].find(b => b.textContent === "Preview").click(); await sleep(30);
-        ok("splash page: Preview shows it now", splashEl() && /Preview/.test(splashEl().querySelector(".bt-sp-skip").textContent));
-        ok("splash: no text unless you write some", !splashEl().querySelector(".bt-sp-text"));
-        splashEl().click(); await sleep(600);
-        ok("splash: a click closes the preview", !splashEl());
-        const previewKind = async (settings, wait = 30) => {
-            Object.assign(sp.w.BThemer.settings, settings);
-            [...spWin.querySelectorAll(".bt-b")].find(b => b.textContent === "Preview").click();
-            await sleep(wait);
-            return splashEl();
-        };
-        const closePreview = async () => { splashEl()?.click(); await sleep(600); };
-        let k = await previewKind({ splashStyle: "clyde", splashBg: "#000000", splashFg: "#ffcc00", splashAccent: "#00ff88", splashSize: 150, splashSpeed: 200, splashClydeAnim: "bounce", splashClydeLook: "outline", splashLoader: "dots" });
-        ok("splash: Discord logo, in your colours, size and speed", k && k.dataset.style === "clyde" && k.style.getPropertyValue("--sp-bg") === "#000000" && k.style.getPropertyValue("--sp-fg") === "#ffcc00" && k.style.getPropertyValue("--sp-accent") === "#00ff88" && k.style.getPropertyValue("--sp-scale") === "1.5" && k.style.getPropertyValue("--sp-k") === "2" && k.querySelector('.bt-k-logo[data-anim="bounce"][data-look="outline"] svg path') && k.querySelectorAll(".bt-k-dots i").length === 3 && !k.querySelector(".bt-sp-video, .bt-sp-logo-wrap"));
-        await closePreview();
-        k = await previewKind({ splashLoader: "bar", splashClydeAnim: "flip" });
-        ok("splash: Discord logo with a loading bar, flipping", k.querySelector('.bt-k-logo[data-anim="flip"]') && k.querySelector(".bt-k-bar i") && sheetsTextOf(sp.w).includes("@keyframes bt-k-flip"));
-        await closePreview();
-        k = await previewKind({ splashLoader: "ring" });
-        ok("splash: Discord logo with a spinner", k.querySelector("svg.bt-k-spin .bt-k-arc"));
-        await closePreview();
-        k = await previewKind({ splashStyle: "morph", splashMorphStay: true }, 120);
-        ok("splash: Shapes into Discord logo (or just the logo where SVG geometry is missing)", k.dataset.style === "morph" && k.querySelector(".bt-k-morph .bt-k-morph-svg path") && sheetsTextOf(sp.w).includes(".bt-k-morph-svg {"));
-        await closePreview();
-        k = await previewKind({ splashStyle: "minimal" });
-        ok("splash: Minimal spinner", k.dataset.style === "minimal" && k.querySelector(".bt-k-minimal svg.bt-k-spin .bt-k-track") && !k.querySelector(".bt-k-logo"));
-        await closePreview();
-        k = await previewKind({ splashStyle: "terminal", splashSpeed: 300 }, 2200);
-        const termText = k.querySelector(".bt-k-term").textContent;
-        ok("splash: Terminal types its boot log in a window, with timestamps and real numbers", /be-themer t/.test(termText) && /\[\s+\d\.\d{3}\] \[ ok \] themes\s+\d+ on/.test(termText) && /plugins\s+\d+ enabled/.test(termText) && k.querySelector(".bt-k-win .bt-k-winbar") && k.querySelector('.bt-k-term[data-cursor="block"] .bt-k-cursor'), termText);
-        await closePreview();
-        k = await previewKind({ splashStyle: "terminal", splashTermLines: "booting the ship | loading crew | launching", splashTermWindow: false, splashTermTimes: false, splashTermCursor: "bar" }, 2200);
-        const ownTerm = k.querySelector(".bt-k-term").textContent;
-        ok("splash: Terminal with your own lines, no frame, no timestamps, bar cursor", /\[ ok \] booting the ship/.test(ownTerm) && /\[ \.\. \] launching/.test(ownTerm) && !/\d\.\d{3}\]/.test(ownTerm) && !k.querySelector(".bt-k-winbar") && k.querySelector('.bt-k-term[data-cursor="bar"]'), ownTerm);
-        await closePreview();
-        k = await previewKind({ splashStyle: "equalizer", splashSpeed: 100 });
-        ok("splash: Equalizer bars, each on its own beat", k.querySelectorAll(".bt-k-eq i").length === 7 && k.querySelector(".bt-k-eq i:nth-child(2)").style.getPropertyValue("--d") === "0.50s" && k.querySelector('.bt-k-eq[data-grow="centre"][data-colors="alternate"]'));
-        await closePreview();
-        k = await previewKind({ splashBars: 16, splashBarWidth: 4, splashBarRound: 0, splashEqColors: "second", splashEqMirror: false });
-        ok("splash: Equalizer: bar count, width, roundness, colours, grows up", k.querySelectorAll(".bt-k-eq i").length === 16 && k.querySelector(".bt-k-eq").style.getPropertyValue("--bw") === "4px" && k.querySelector(".bt-k-eq").style.getPropertyValue("--br") === "0px" && k.querySelector('.bt-k-eq[data-grow="up"][data-colors="second"]'));
-        await closePreview();
-        k = await previewKind({ splashStyle: "shapes" });
-        ok("splash: Shapes (circle, square, triangle)", k.querySelectorAll('.bt-k-shapes[data-motion="hop"] i').length === 3 && sheetsTextOf(sp.w).includes("@keyframes bt-k-hop-turn"));
-        await closePreview();
-        k = await previewKind({ splashShapesMotion: "morph" });
-        ok("splash: Shapes: one morphing shape", k.querySelectorAll('.bt-k-shapes[data-motion="morph"] i').length === 1 && sheetsTextOf(sp.w).includes("@keyframes bt-k-morph"));
-        await closePreview();
-        k = await previewKind({ splashStyle: "counter" }, 700);
-        const counted = +k.querySelector(".bt-k-num").firstChild.textContent;
-        ok("splash: Counter climbs (and never claims 100)", counted > 20 && counted < 100 && k.querySelector(".bt-k-line i").style.getPropertyValue("--p") === `${counted}%`, String(counted));
-        await closePreview();
-        k = await previewKind({ splashCounterMode: "elapsed", splashCounterFont: "mono", splashCounterLine: false }, 400);
-        ok("splash: Counter: honest seconds elapsed, monospace, no line", /^0\.\d\d$/.test(k.querySelector(".bt-k-num").firstChild.textContent) && k.querySelector('.bt-k-num[data-font="mono"] small').textContent === "s" && !k.querySelector(".bt-k-line"));
-        await closePreview();
-        k = await previewKind({ splashStyle: "minimal", splashSpinner: "ticks", splashThickness: 3 });
-        ok("splash: Minimal: tick wheel, your thickness", k.querySelectorAll(".bt-k-wheel-ticks i").length === 12 && k.style.getPropertyValue("--sp-thick") === "3px");
-        await closePreview();
-        k = await previewKind({ splashSpinner: "squares" });
-        ok("splash: Minimal: two squares", k.querySelectorAll(".bt-k-squares i").length === 2);
-        await closePreview();
-        k = await previewKind({ splashStyle: "clyde", splashLoader: "ripple", splashClydeLook: "duotone", splashText: "hold tight", splashTextSize: 12, splashTextOpacity: 40, splashPlace: "low", splashPattern: "dots", splashPatternOpacity: 10 });
-        const cap = k.querySelector(".bt-k .bt-k-caption");
-        ok("splash: your text sits quietly just under the logo", cap && cap.textContent === "hold tight" && cap.previousElementSibling === k.querySelector(".bt-k-stage") && !k.querySelector(".bt-sp-center .bt-sp-text") && k.style.getPropertyValue("--sp-ts") === "12px" && k.style.getPropertyValue("--sp-to") === "0.4");
-        ok("splash: position, flat pattern (SVG, not a gradient), ripples, two-colour logo", k.dataset.place === "low" && k.dataset.pattern === "dots" && /^url\("data:image\/svg\+xml,/.test(k.style.getPropertyValue("--sp-pattern")) && !/gradient/.test(k.style.getPropertyValue("--sp-pattern")) && k.querySelectorAll(".bt-k-ripple i").length === 2 && k.querySelector('.bt-k-logo[data-look="duotone"]'));
-        await closePreview();
-        Object.assign(sp.w.BThemer.settings, { splashStyle: "clyde", splashSpeed: 100, splashSize: 100, splashText: "", splashPlace: "center", splashPattern: "none" });
-        const old = makeWindow(`<!doctype html><html><body><div id="app-mount">${LOADING}</div></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: { splashStyle: "animated" } });
-        await sleep(20);
-        old.w.eval(renderer); await sleep(80);
-        ok("splash: an old motion-video setting becomes the Discord logo screen", old.w.BThemer.settings.splashStyle === "clyde" && old.w.document.querySelector("#bt-splash .bt-k-clyde") && !old.w.document.querySelector("#bt-splash video"));
-        const boot = makeWindow(`<!doctype html><html><body><div id="app-mount"></div></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: {} });
-        Object.defineProperty(boot.w.document, "readyState", { get: () => "loading", configurable: true });
-        boot.w.eval(renderer);
-        const bootEl = () => boot.w.document.getElementById("bt-splash");
-        ok("splash: up the moment Be Themer starts (before Discord's page has loaded), over everything", bootEl() && bootEl().parentElement === boot.w.document.documentElement && bootEl().dataset.style === "clyde" && boot.w.document.documentElement.hasAttribute("data-bt-loading") && boot.w.document.adoptedStyleSheets.length > 0);
-        delete boot.w.document.readyState;
-        boot.w.document.dispatchEvent(new boot.w.Event("DOMContentLoaded"));
-        await sleep(40);
-        boot.w.document.getElementById("app-mount").insertAdjacentHTML("beforeend", LOADING); await sleep(60);
-        ok("splash: stays up while Discord shows its own loading screen (no second splash)", bootEl() && bootEl().parentElement === boot.w.document.documentElement && boot.w.document.querySelectorAll("#bt-splash").length === 1);
-        boot.w.document.querySelector(".loadingWrap_x").remove();
-        const bootNav = boot.w.document.createElement("nav");
-        bootNav.className = "guilds_x";
-        boot.w.document.getElementById("app-mount").append(bootNav);
-        await sleep(60);
-        ok("splash: fades out once Discord's app is on screen", bootEl() && bootEl().classList.contains("bt-out"));
-        await sleep(600);
-        ok("splash: and is gone", !bootEl());
-        const none1 = makeWindow(`<!doctype html><html><body><div id="app-mount">${LOADING}</div></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: { splashStyle: "discord" } });
-        none1.w.eval(renderer); await sleep(40);
-        const none2 = makeWindow(`<!doctype html><html><body><div id="app-mount">${LOADING}</div></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: { enabled: false } });
-        none2.w.eval(renderer); await sleep(40);
-        ok("splash: Discord's own screen with Discord's own, or while Be Themer is off", !none1.w.document.getElementById("bt-splash") && !none2.w.document.getElementById("bt-splash") && !none1.w.document.querySelector("[data-bt-splash-host]"));
-
-        const m = makeWindow(`<!doctype html><html><body></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: { petals: false, petalCount: 50, hideNitro: true } });
-        m.w.eval(renderer); await sleep(80);
-        const l2 = Object.fromEntries(m.w.BThemer.plugins.list().map(p => [p.id, p]));
-        ok("v1.0 settings migrated", (!V.hasPlugin("sakuraPetals") || !l2.sakuraPetals.running) && (!V.hasPlugin("hideNitro") || l2.hideNitro.running) && m.w.BThemer.settings.plugins.sakuraPetals.settings.count === 50 && !("petals" in m.w.BThemer.settings));
-
-    }
-    const p = makeWindow(`<!doctype html><html><body></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: {} });
-    p.w.eval(renderer);
-    p.w.eval(`
-      (() => {
-        const modules = {}, cache = {};
-        const req = id => { if (cache[id]) return cache[id].exports; const m = (cache[id] = { exports: {} }); modules[id].call(m.exports, m, m.exports, req); return m.exports; };
-        const jsonp = (parent, data) => { for (const k in data[1]) modules[k] = data[1][k]; if (parent) parent(data); };
-        const g = (self.webpackChunkdiscord_app = self.webpackChunkdiscord_app || []);
-        g.forEach(jsonp.bind(null, 0));
-        g.push = jsonp.bind(null, g.push.bind(g));
-        window.__req = req;
-      })();
-      (self.webpackChunkdiscord_app = self.webpackChunkdiscord_app || []).push([[1], {
-        9: function (e) { e.exports = { createElement: () => null, useEffect: () => {}, useRef: () => ({}) }; }, /* a React look-alike without Component/version: must be ignored */
-        10: function (e) { e.exports = { version: "18.3.1", Component: class {}, createElement: (t, p, ...c) => ({ t, p, c }), useEffect: () => {}, useRef: () => ({ current: null }) }; },
-        11: function (e, t) { Object.defineProperty(t, "Z", { enumerable: true, get: () => ({ SECTION: 41, SIDEBAR_ITEM: 42, PANEL: 43, CATEGORY: 45, CUSTOM: 49 }) }); },
-        12: (e, t, n) => { const root = { key: "$Root", buildLayout: () => [{ key: "user_section" }, { key: "x" }, { key: "billing_section" }] }; e.exports = { layout: () => root.buildLayout().map(s => s) }; },
-      }]);
-    `);
-    p.w.__req(9); p.w.__req(10); p.w.__req(11);
-    const layout = p.w.__req(12).layout();
-    const keys = layout.map(n => n.key);
-    ok("webpack: settings module patched", p.w.BThemer.debug().patchesApplied.includes("settings section"), JSON.stringify(p.w.BThemer.debug()));
-    ok("webpack: React + layout types picked up", p.w.BThemer.debug().reactFound && p.w.BThemer.debug().layoutTypesFound);
-    ok("webpack: Be Themer section above billing", keys.join(",") === "user_section,x,bthemer_section,billing_section", keys.join(","));
-    const section = layout[2];
-    const entries = section.buildLayout();
-    ok("webpack: section uses Discord's real type ids", section.type === 41 && entries.every(e => e.type === 42) && section.useTitle() === TITLES[0]);
-    const logoIcon = entries[0].icon();
-    ok("webpack: the Be Themer entry shows the app logo", logoIcon.t === "img" && /^data:image\/png;base64,/.test(logoIcon.p.src) && logoIcon.p.width === 20);
-    ok("webpack: other entries keep their icons", entries[1].icon().t === "svg");
-    ok("webpack: one entry per page", entries.map(e => e.useTitle()).join(",") === TITLES.join(","), entries.map(e => e.useTitle()).join(","));
-    const custom = entries[1].buildLayout()[0].buildLayout()[0].buildLayout()[0];
-    ok("webpack: page component is wired", custom.type === 49 && typeof custom.Component === "function" && (c => (c.p && c.p.className === "bt-native") || (typeof c.t === "function" && c.c[0] && c.c[0].p.className === "bt-native"))(custom.Component()));
-    {
-        if (V.featureOn("themes")) {
-            const themePanel = entries.find(e => e.useTitle() === "Discord Theme").buildLayout()[0];
-            const cats = themePanel.buildLayout();
-            const titled = cats.filter(c => typeof c.useTitle === "function").map(c => c.useTitle());
-            ok("webpack: Discord Theme's sections are Discord categories (listed under it in the sidebar, like Account's)", cats.every(c => c.type === cats[0].type) && typeof cats[0].useTitle !== "function" && titled.join(" | ") === "Colour presets | Wallpaper | Gradient | Glass panels | Role colours | Colours, font and shape | Messages | Voice | Theme files", titled.join(" | "));
-            const wallCat = cats.find(c => c.useTitle && c.useTitle() === "Wallpaper");
-            const comp = wallCat.buildLayout()[0].Component();
-            const node = comp.p && comp.p.className === "bt-native" ? comp : comp.c[0];
-            const host = p.w.document.createElement("div");
-            node.p.ref(host);
-            const secs = host.querySelectorAll(".bt-sec");
-            ok("webpack: a section's category shows only that section", secs.length === 1 && !host.querySelector(".bt-sec-head") && host.textContent.includes("Your own picture behind Discord") && !host.querySelector(".bt-off-warn"), host.innerHTML.slice(0, 200));
-            const headComp = cats[0].buildLayout()[0].Component();
-            const headNode = headComp.p && headComp.p.className === "bt-native" ? headComp : headComp.c[0];
-            const headHost = p.w.document.createElement("div");
-            headNode.p.ref(headHost);
-            ok("webpack: the top of Discord Theme keeps its switch and notices", headHost.querySelector(".bt-off-warn") && headHost.querySelectorAll(".bt-sec").length === 1 && !headHost.textContent.includes("Your own picture behind Discord"));
-        }
-        const pluginsPanel = entries.find(e => e.useTitle() === "Plugins").buildLayout()[0];
-        ok("webpack: other pages stay one category", pluginsPanel.buildLayout().length === 1);
-    }
-    ok("webpack: layout not duplicated on rebuild", p.w.__req(12).layout().filter(n => n.key === "bthemer_section").length === 1);
-
-    console.log(results.join("\n"));
-    console.log(`\n${results.filter(r => r.startsWith("PASS")).length}/${results.length} passed`);
-    process.exit(results.some(r => r.startsWith("FAIL")) ? 1 : 0);
-})().catch(e => { console.log(results.join("\n")); console.error(e); process.exit(1); });
+
+
+
+
+
+
+    if (V.hasPlugin("hideNitro")) {
+
+
+
+
+
+
+
+
+        B.plugins.enable("hideNitro"); await sleep(20);
+
+
+
+
+
+
+
+
+
+        ok("enable hideNitro -> css applied", sheetsText().includes('a[href="/store"]') && list().hideNitro.running);
+
+
+
+
+
+
+
+
+
+        B.plugins.disable("hideNitro"); await sleep(20);
+
+
+
+
+
+
+
+
+
+        ok("disable hideNitro -> css removed", !sheetsText().includes('a[href="/store"]') && !list().hideNitro.running);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    }
+
+
+
+
+
+
+
+
+    if (V.hasPlugin("keywordHighlight")) {
+
+
+
+
+
+
+
+        B.plugins.enable("keywordHighlight"); await sleep(20);
+
+
+
+
+
+
+
+
+
+        ok("keywordHighlight starts", list().keywordHighlight.running);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    }
+
+
+
+
+
+
+
+    B.plugins.enable("myPlugin"); await sleep(20);
+
+
+
+
+
+
+
+
+
+    ok("user plugin starts", list().myPlugin.running);
+
+
+
+
+
+
+
+
+
+    ok("user plugin css (function of settings)", sheetsText().includes("drop-shadow(0 0 12px #ff7eb6)"));
+
+
+
+
+
+
+
+
+
+    ok("user plugin observe() ran", w.document.getElementById("message-content-1").dataset.seenByMyPlugin === "1");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    B.open("plugins"); await sleep(30);
+
+
+
+
+
+
+
+
+
+    let win = w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+    ok("settings window opens", !!win);
+
+
+
+
+
+
+
+
+
+    const logoImg = win.querySelector(".bt-window-title img.bt-logo");
+
+
+
+
+
+
+
+
+
+    ok("app logo in the window title", logoImg && /^data:image\/png;base64,iVBOR/.test(logoImg.getAttribute("src")));
+
+
+
+
+
+
+
+
+
+    const tab = page => win.querySelector(`.bt-tab[data-page="${page}"]`);
+
+
+
+
+
+
+
+
+
+    const TITLES = [...win.querySelectorAll(".bt-tab")].map(t => t.textContent);
+
+
+
+
+
+
+
+
+
+    if (V.featureOn("themes")) ok("window has page tabs", [...win.querySelectorAll(".bt-tab")].map(t => t.dataset.page).join(",") === ["general", "theme", "servers", "maker", "plugins", ...(V.featureOn("meow") ? ["meow"] : []), ...(V.featureOn("owlie") ? ["owlie"] : []), "splash", "quickcss"].join(","));
+
+
+
+
+
+
+
+
+
+    ok("plugins tab is active", win.querySelector(".bt-tab-active").dataset.page === "plugins" && !win.querySelector('input[data-k="accent"]'));
+
+
+
+
+
+
+
+
+
+    const pluginNames = [...win.querySelectorAll(".bt-plugins-list b")].map(b => b.textContent);
+
+
+
+
+
+
+
+
+
+    ok("panel lists plugins", pluginNames.includes("My Plugin") && (!V.hasPlugin("sakuraPetals") || pluginNames.includes("Sakura Petals")), pluginNames.join(" | "));
+
+
+
+
+
+
+
+
+
+    ok("panel shows load failure for broken.js", win.textContent.includes("boom on load"));
+
+
+
+
+
+
+
+
+
+    ok("panel shows start error", win.textContent.includes("start exploded"));
+
+
+
+
+
+
+
+
+
+    const strength = win.querySelector('.bt-plugins-list input[data-k="strength"]');
+
+
+
+
+
+
+
+
+
+    ok("plugin setting control rendered", !!strength);
+
+
+
+
+
+
+
+
+
+    strength.value = "30";
+
+
+
+
+
+
+
+
+
+    strength.dispatchEvent(new w.Event("input")); await sleep(20);
+
+
+
+
+
+
+
+
+
+    ok("plugin setting change re-renders css", sheetsText().includes("drop-shadow(0 0 30px"));
+
+
+
+
+
+
+
+
+
+    if (V.hasPlugin("keywordHighlight")) {
+        const kw = win.querySelector('.bt-plugins-list input[data-k="keywords"]');
+
+
+
+
+
+
+
+
+
+        kw.value = "anime";
+
+
+
+
+
+
+
+
+
+        kw.dispatchEvent(new w.Event("input")); await sleep(20);
+
+
+
+
+
+
+
+
+
+        ok("keywordHighlight marks message on setting change", w.document.querySelector("li").hasAttribute("data-bt-keyword"));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    }
+    if (V.featureOn("themes") && V.featureOn("customCss")) {
+
+
+
+        tab("theme").click(); await sleep(20);
+
+
+
+
+
+
+
+
+
+        ok("switching tab shows the appearance page", !!win.querySelector('input[data-k="accent"]') && !win.querySelector(".bt-plugins-list"));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        tab("quickcss").click(); await sleep(20);
+
+
+
+
+
+
+
+
+
+        const editor = win.querySelector("textarea.bt-quickcss");
+
+
+
+
+
+
+
+
+
+        ok("QuickCSS editor shows file contents", editor && editor.value === "/*q*/");
+
+
+
+
+
+
+
+
+
+        editor.value = "body { --qc-test: 1; }";
+
+
+
+
+
+
+
+
+
+        editor.dispatchEvent(new w.Event("input")); await sleep(500);
+
+
+
+
+
+
+
+
+
+        ok("QuickCSS applies as you type", sheetsText().includes("--qc-test: 1"));
+
+
+
+
+
+
+
+
+
+        ok("QuickCSS is saved to disk", quickSaved.at(-1) === "body { --qc-test: 1; }");
+
+
+
+
+
+
+
+
+
+        tab("theme").click(); await sleep(20);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const accent = win.querySelector('input[data-k="accent"]');
+
+
+
+
+
+
+
+
+
+        accent.value = "#00ff00";
+
+
+
+
+
+
+
+
+
+        accent.dispatchEvent(new w.Event("input")); await sleep(60);
+
+
+
+
+
+
+
+
+
+        ok("core accent change -> vars", sheetsText().includes("--bt-accent: #00ff00"));
+
+
+
+
+
+
+
+
+
+        const ring = win.querySelector('input[data-k="soundboardRing"]');
+
+
+
+
+
+
+
+
+
+        ring.value = "#ff00aa";
+
+
+
+
+
+
+
+
+
+        ring.dispatchEvent(new w.Event("input")); await sleep(60);
+
+
+
+
+
+
+
+
+
+        if (V.featureOn("themes")) ok("voice: soundboard ring colour setting", sheetsText().includes("--brand-500: #ff00aa !important;"));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ok("floating 🌸 button is gone", !w.document.getElementById("bt-btn") && !w.document.getElementById("bt-menu"));
+
+
+
+
+
+
+
+
+
+    }
+
+
+
+    tab("general").click(); await sleep(20);
+
+
+
+
+
+
+
+
+
+    const quick = () => (win.querySelector(".bt-quick-actions") || {}).textContent || "";
+
+
+
+
+
+
+
+
+
+    ok("quick actions list plugin items", quick().includes("Say hi") && (!V.hasPlugin("sakuraPetals") || quick().includes("Pause / resume petals")), quick());
+
+
+
+
+
+
+
+
+
+    ok("quick actions: Reload Discord (for builds where Ctrl+R does nothing)", quick().includes("Reload Discord"));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    w.eval(wrap("myPlugin.js", template.replace('"1.0.0"', '"1.0.1"'))); await sleep(20);
+
+
+
+
+
+
+
+
+
+    ok("hot reload keeps plugin running", list().myPlugin.running);
+
+
+
+
+
+
+
+
+
+    ok("hot reload doesn't duplicate css", (sheetsText().match(/drop-shadow\(0 0 30px/g) || []).length === 1);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    B.toggle(); await sleep(30);
+
+
+
+
+
+
+
+
+
+    ok("voice: no ring rule while everything is off", !w.document.adoptedStyleSheets.some(s => s.text.includes('[style*="--brand-500"]')));
+
+
+
+
+
+
+
+
+
+    ok("toggle off stops all plugins", B.plugins.list().every(p => !p.running) && !w.document.getElementById("bt-petals"));
+
+
+
+
+
+
+
+
+
+    B.toggle(); await sleep(30);
+
+
+
+
+
+
+
+
+
+    ok("toggle on restarts enabled plugins", (!V.hasPlugin("sakuraPetals") || list().sakuraPetals.running) && list().myPlugin.running && (!V.hasPlugin("hideNitro") || !list().hideNitro.running));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    w.eval(`window.BThemer.__syncUserPlugins([])`); await sleep(20);
+
+
+
+
+
+
+
+
+
+    ok("deleted user plugin unloads", !list().myPlugin);
+
+
+
+
+
+
+
+
+
+    await sleep(10);
+
+
+
+
+
+
+
+
+
+    ok("its quick action is removed", !quick().includes("Say hi") && (!V.hasPlugin("sakuraPetals") || quick().includes("Pause / resume petals")));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    await sleep(400);
+
+
+
+
+
+
+
+
+
+    const last = saved.at(-1);
+
+
+
+
+
+
+
+
+
+    ok("settings saved incl. plugin state", last && last.plugins.myPlugin.enabled === true && last.plugins.myPlugin.settings.strength === 30 && (!V.featureOn("themes") || last.accent === "#00ff00"));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if (V.featureOn("themes")) {
+
+
+        const sv = makeWindow(
+
+
+
+
+
+
+
+
+
+            `<!doctype html><html><head><title>Discord | #general | Srv</title></head><body><nav class="guilds_abc"></nav></body></html>`,
+
+
+
+
+
+
+
+
+
+            {
+
+
+
+
+
+
+
+
+
+                version: "t", dataDir: "", quickCss: "",
+
+
+
+
+
+
+
+
+
+                themes: [{ file: "extra.css", source: "user", css: "/*extra-marker*/", name: "Extra" }, { file: "b-themer.theme.css", source: "bundled", css: theme, name: "B-Themer" }],
+
+
+
+
+
+
+
+
+
+                settings: { settingsVersion: 2, accent: "#aa0000", serverThemes: { 111: { name: "Srv", preset: "Ocean", background: "global", themes: [] }, 999: null } },
+
+
+
+
+
+
+
+
+
+            },
+
+
+
+
+
+
+
+
+
+            "https://discord.com/channels/111/222",
+
+
+
+
+
+
+
+
+
+        );
+
+
+
+
+
+
+
+
+
+        sv.w.eval(renderer); await sleep(80);
+
+
+
+
+
+
+
+
+
+        const SB = sv.w.BThemer;
+
+
+
+
+
+
+
+
+
+        const svText = () => sv.w.document.adoptedStyleSheets.filter(s => !s.disabled).map(s => s.text).join("\n");
+
+
+
+
+
+
+
+
+
+        const svVar = name => (svText().split(":root:root {")[1]?.match(new RegExp(`${name}: ([^;]+);`)) || [])[1];
+
+
+
+
+
+
+
+
+
+        const go = async path => { sv.w.history.pushState({}, "", path); await sleep(40); };
+
+
+
+
+
+
+
+
+
+        const prof = () => SB.settings.serverThemes[111];
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ok("server: broken profile entries dropped", !(999 in SB.settings.serverThemes));
+
+
+
+
+
+
+
+
+
+        ok("server: preset profile migrated to show its gradient", prof().background === "gradient" && SB.settings.settingsVersion === 3);
+
+
+
+
+
+
+
+
+
+        ok("server: preset gradient + accent applied", svVar("--bt-grad-1") === "#0288d1" && svVar("--bt-accent") === "#4fc3f7", `${svVar("--bt-grad-1")} ${svVar("--bt-accent")}`);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        SB.open("theme"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        let sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        const notice = () => sw.querySelector(".bt-server-notice");
+
+
+
+
+
+
+
+
+
+        ok("server: Discord Theme page says this server overrides it", notice() && !notice().hidden && notice().textContent.includes("Srv"));
+
+
+
+
+
+
+
+
+
+        const gradToggle = sw.querySelector('input[data-k="gradEnabled"]');
+
+
+
+
+
+
+
+
+
+        ok("gradient: client-wide switch shown", !!gradToggle && gradToggle.checked);
+
+
+
+
+
+
+
+
+
+        gradToggle.checked = false;
+
+
+
+
+
+
+
+
+
+        gradToggle.dispatchEvent(new sv.w.Event("input")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("gradient: switch off keeps the server's own gradient", SB.settings.gradEnabled === false && svVar("--bt-grad-alpha") === "100%");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        await go("/channels/@me");
+
+
+
+
+
+
+
+
+
+        ok("gradient: off outside the server (plain base, no animation)", svVar("--bt-grad-alpha") === "0%" && svVar("--bt-bg-animation") === "none" && svVar("--bt-accent") === "#aa0000", `${svVar("--bt-grad-alpha")} ${svVar("--bt-bg-animation")}`);
+
+
+
+
+
+
+
+
+
+        ok("server: notice hidden outside the server", notice().hidden);
+
+
+
+
+
+
+
+
+
+        await go("/channels/111/333");
+
+
+
+
+
+
+
+
+
+        ok("server: back in the server, its look returns", svVar("--bt-grad-alpha") === "100%" && svVar("--bt-grad-1") === "#0288d1");
+
+
+
+
+
+
+
+
+
+        gradToggle.checked = true;
+
+
+
+
+
+
+
+
+
+        gradToggle.dispatchEvent(new sv.w.Event("input")); await sleep(40);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        SB.open("servers"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        const card = () => sw.querySelector('.bt-server[data-server="111"]');
+
+
+
+
+
+
+
+
+
+        ok("server: card for the server you're in is open", !!card() && !!card().querySelector(".bt-server-body"));
+
+
+
+
+
+
+
+
+
+        [...card().querySelectorAll(".bt-server-presets .bt-b")].find(b => b.textContent === "Neon").click(); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("server: picking a preset changes this server live", svVar("--bt-grad-1") === "#ff2e88" && svVar("--bt-accent") === "#ff2e88" && prof().preset === "Neon");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const g1 = card().querySelector('.bt-server-rows input[data-k="grad1"]');
+
+
+
+
+
+
+
+
+
+        ok("server: fine-tune shows the preset's value", g1 && g1.value === "#ff2e88");
+
+
+
+
+
+
+
+
+
+        g1.value = "#123456";
+
+
+
+
+
+
+
+
+
+        g1.dispatchEvent(new sv.w.Event("input")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("server: fine-tuned glow applies live and is stored on the server", svVar("--bt-grad-1") === "#123456" && prof().grad1 === "#123456" && SB.settings.grad1 !== "#123456");
+
+
+
+
+
+
+
+
+
+        g1.dispatchEvent(new sv.w.Event("change", { bubbles: true })); await sleep(20);
+
+
+
+
+
+
+
+
+
+        const reset = [...card().querySelectorAll(".bt-server-tune .bt-b")].find(b => /Reset/.test(b.textContent));
+
+
+
+
+
+
+
+
+
+        ok("server: reset button appears after a change", !!reset);
+
+
+
+
+
+
+
+
+
+        reset.click(); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("server: reset goes back to the preset", svVar("--bt-grad-1") === "#ff2e88" && !("grad1" in prof()));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const extra = [...card().querySelectorAll(".bt-server-themes label")].find(l => l.textContent === "Extra").querySelector("input");
+
+
+
+
+
+
+
+
+
+        extra.checked = true;
+
+
+
+
+
+
+
+
+
+        extra.dispatchEvent(new sv.w.Event("change")); await sleep(20);
+
+
+
+
+
+
+
+
+
+        const order = svText();
+
+
+
+
+
+
+
+
+
+        ok("server: extra theme loads after yours", order.includes("/*extra-marker*/") && order.indexOf("/*extra-marker*/") > order.indexOf("--bt-theme-loaded"));
+
+
+
+
+
+
+
+
+
+        await go("/channels/@me");
+
+
+
+
+
+
+
+
+
+        ok("server: extra theme only in that server", !svText().includes("/*extra-marker*/"));
+
+
+
+
+
+
+
+
+
+        await go("/channels/111/222");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const enable = card().querySelector(".bt-server-actions input");
+
+
+
+
+
+
+
+
+
+        enable.checked = false;
+
+
+
+
+
+
+
+
+
+        enable.dispatchEvent(new sv.w.Event("change")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("server: turning one server off restores your look there", svVar("--bt-accent") === "#aa0000" && !svText().includes("/*extra-marker*/") && prof().preset === "Neon");
+
+
+
+
+
+
+
+
+
+        card().querySelector(".bt-server-actions input").checked = true;
+
+
+
+
+
+
+
+
+
+        card().querySelector(".bt-server-actions input").dispatchEvent(new sv.w.Event("change")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("server: turning it back on", svVar("--bt-accent") === "#ff2e88");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const master = sw.querySelector('input[data-k="__serverThemesEnabled"]');
+
+
+
+
+
+
+
+
+
+        master.checked = false;
+
+
+
+
+
+
+
+
+
+        master.dispatchEvent(new sv.w.Event("change")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("server: master switch off disables every server look", svVar("--bt-accent") === "#aa0000" && SB.settings.serverThemesEnabled === false);
+
+
+
+
+
+
+
+
+
+        master.checked = true;
+
+
+
+
+
+
+
+
+
+        master.dispatchEvent(new sv.w.Event("change")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("server: master switch on again", svVar("--bt-accent") === "#ff2e88");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const offWarn = () => sw.querySelector(".bt-off-warn");
+
+
+
+
+
+
+
+
+
+        ok("everything on: no 'switched off' warning", offWarn() && offWarn().hidden);
+
+
+
+
+
+
+
+
+
+        SB.toggle(); await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("everything off: warning shown on the page", !offWarn().hidden && sv.w.document.adoptedStyleSheets.find(s => s.text.includes("--bt-theme-loaded")).disabled);
+
+
+
+
+
+
+
+
+
+        offWarn().querySelector("button").click(); await sleep(30);
+
+
+
+
+
+
+
+
+
+        SB.open("general"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        const flip = async (k, on) => {
+
+
+
+
+
+
+
+
+
+            const i = sw.querySelector(`input[data-k="__${k}"]`);
+
+
+
+
+
+
+
+
+
+            i.checked = on;
+
+
+
+
+
+
+
+
+
+            i.dispatchEvent(new sv.w.Event("change")); await sleep(40);
+
+
+
+
+
+
+
+
+
+            return i;
+
+
+
+
+
+
+
+
+
+        };
+
+
+
+
+
+
+
+
+
+        const themeOn = () => svText().includes("--bt-theme-loaded");
+
+
+
+
+
+
+
+
+
+        ok("switches: my theme, this server, per-server, glass, everything", ["theme", "hereLook", "serverLooks", "glass", "everything"].every(k => sw.querySelector(`input[data-k="__${k}"]`)));
+
+
+
+
+
+
+
+
+
+        await flip("theme", false);
+
+
+
+
+
+
+
+
+
+        ok("my theme off: this server keeps its look", themeOn() && svVar("--bt-accent") === "#ff2e88" && !SB.settings.enabledThemes.includes("b-themer.theme.css"));
+
+
+
+
+
+
+
+
+
+        await go("/channels/@me");
+
+
+
+
+
+
+
+
+
+        ok("my theme off: plain Discord outside it", !themeOn());
+
+
+
+
+
+
+
+
+
+        ok("this-server switch says to open a server", sw.querySelector(".bt-here-look").textContent.includes("Open a server"));
+
+
+
+
+
+
+
+
+
+        await go("/channels/111/222");
+
+
+
+
+
+
+
+
+
+        await flip("hereLook", false);
+
+
+
+
+
+
+
+
+
+        ok("this server's look off: your (switched-off) theme applies", !themeOn() && prof().enabled === false);
+
+
+
+
+
+
+
+
+
+        await flip("hereLook", true);
+
+
+
+
+
+
+
+
+
+        await flip("theme", true);
+
+
+
+
+
+
+
+
+
+        ok("both back on", themeOn() && svVar("--bt-accent") === "#ff2e88");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        await flip("glass", false);
+
+
+
+
+
+
+
+
+
+        ok("liquid glass off: solid panels, no blur", svVar("--bt-glass-alpha") === "1" && svVar("--bt-glass-filter") === "none" && SB.settings.translucent === false);
+
+
+
+
+
+
+
+
+
+        SB.open("theme"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        let note = sv.w.document.querySelector("#bt-window .bt-wall-glass-note");
+
+
+
+
+
+
+
+
+
+        ok("wallpaper: says solid panels cover it while liquid glass is off", note && !note.hidden && /cover your wallpaper/.test(note.textContent));
+
+
+
+
+
+
+
+
+
+        [...note.querySelectorAll(".bt-b")].find(b => b.textContent === "Turn liquid glass on").click(); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("wallpaper: one click turns liquid glass back on", SB.settings.translucent === true && note.hidden && svVar("--bt-glass-alpha") === "0.38");
+
+
+
+
+
+
+
+
+
+        SB.settings.translucent = false;
+
+
+
+
+
+
+
+
+
+        SB.open("general"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        await flip("glass", true);
+
+
+
+
+
+
+
+
+
+        ok("liquid glass on again", svVar("--bt-glass-alpha") === "0.38" && !svVar("--bt-glass-filter"));
+
+
+
+
+
+
+
+
+
+        prof().translucent = false;
+
+
+
+
+
+
+
+
+
+        await flip("glass", true);
+
+
+
+
+
+
+
+
+
+        ok("a server can have its own liquid glass setting", svVar("--bt-glass-alpha") === "1");
+
+
+
+
+
+
+
+
+
+        delete prof().translucent;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const doc = sv.w.document;
+
+
+
+
+
+
+
+
+
+        const layers = doc.createElement("div");
+
+
+
+
+
+
+
+
+
+        layers.className = "layers_x";
+
+
+
+
+
+
+
+
+
+        layers.innerHTML = `<div role="list"><div class="tooltip_a"><span>Angieee</span></div><div class="tip_b">in-app tip</div></div>`;
+
+
+
+
+
+
+
+
+
+        const loading = doc.createElement("div");
+
+
+
+
+
+
+
+
+
+        loading.innerHTML = `<div class="tipTitle_c">Did you know</div><div class="tip_d">Discord tip</div>`;
+
+
+
+
+
+
+
+
+
+        doc.body.append(layers, loading);
+
+
+
+
+
+
+
+
+
+        await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("loading quotes: member names untouched", layers.textContent.includes("Angieee") && layers.textContent.includes("in-app tip"));
+
+
+
+
+
+
+
+
+
+        ok("loading quotes: loading screen tip replaced", !loading.textContent.includes("Discord tip") && loading.querySelector(".tip_d").dataset.btQuote === "1");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const rolesAttr = () => doc.documentElement.getAttribute("data-bt-roles");
+
+
+
+
+
+
+
+
+
+        ok("roles: off by default", rolesAttr() === null);
+
+
+
+
+
+
+
+
+
+        ok("roles: styles are in the UI sheet", svText().includes('html[data-bt-roles="shine"]') && svText().includes("-webkit-text-fill-color: transparent"));
+
+
+
+
+
+
+
+
+
+        SB.open("theme"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        const roleSel = sw.querySelector('select[data-k="roleStyle"]');
+
+
+
+
+
+
+
+
+
+        roleSel.value = "shine";
+
+
+
+
+
+
+
+
+
+        roleSel.dispatchEvent(new sv.w.Event("change")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("roles: your style applies", rolesAttr() === "shine" && SB.settings.roleStyle === "shine" && svVar("--bt-role-speed") === "4s");
+
+
+
+
+
+
+
+
+
+        SB.open("servers"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        const srvRole = card().querySelector('.bt-server-rows select[data-k="roleStyle"]');
+
+
+
+
+
+
+
+
+
+        ok("roles: server card has its own role style (showing yours until changed)", srvRole && srvRole.value === "shine");
+
+
+
+
+
+
+
+
+
+        srvRole.value = "holo";
+
+
+
+
+
+
+
+
+
+        srvRole.dispatchEvent(new sv.w.Event("change")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("roles: server's own style in that server", rolesAttr() === "holo" && prof().roleStyle === "holo" && SB.settings.roleStyle === "shine");
+
+
+
+
+
+
+
+
+
+        await go("/channels/@me");
+
+
+
+
+
+
+
+
+
+        ok("roles: your style elsewhere", rolesAttr() === "shine");
+
+
+
+
+
+
+
+
+
+        await go("/channels/111/222");
+
+
+
+
+
+
+
+
+
+        const fontSel = card().querySelector('.bt-server-rows select[data-k="font"]');
+
+
+
+
+
+
+
+
+
+        fontSel.value = "mono";
+
+
+
+
+
+
+
+
+
+        fontSel.dispatchEvent(new sv.w.Event("change")); await sleep(40);
+
+
+
+
+
+
+
+
+
+        [...card().querySelectorAll(".bt-server-presets .bt-b")].find(b => b.textContent === "Ocean").click(); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("presets: picking one keeps the server's font and role style", prof().font === "mono" && prof().roleStyle === "holo" && svVar("--bt-grad-1") === "#0288d1");
+
+
+
+
+
+
+
+
+
+        ok("server card groups its settings", [...card().querySelectorAll(".bt-server-group")].map(g => g.textContent).join("|") === "Gradient|Colours and glass|Names and text");
+
+
+
+
+
+
+
+
+
+        SB.toggle(); await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("roles: off while everything is off", rolesAttr() === null);
+
+
+
+
+
+
+
+
+
+        SB.toggle(); await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("roles: back with everything on", rolesAttr() === "holo");
+
+
+
+
+
+
+
+
+
+        for (const k of ["roleStyle", "font"]) delete prof()[k];
+
+
+
+
+
+
+
+
+
+        SB.settings.roleStyle = "off";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        SB.open("plugins"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        ok("pages have plain names", [...sw.querySelectorAll(".bt-tab")].map(t => t.textContent).join(",") === ["Be Themer", "Discord Theme", "Server Theme", "Theme Maker", "Plugins", ...(V.featureOn("meow") ? ["Meow"] : []), ...(V.featureOn("owlie") ? ["Owlie"] : []), "Splash", "Custom CSS"].join(","));
+
+
+
+
+
+
+
+
+
+        const cards = () => [...sw.querySelectorAll(".bt-plugins-list .bt-card")];
+
+
+
+
+
+
+
+
+
+        const search = sw.querySelector(".bt-search");
+
+
+
+
+
+
+
+
+
+        search.value = "petal";
+
+
+
+
+
+
+
+
+
+        search.dispatchEvent(new sv.w.Event("input")); await sleep(20);
+
+
+
+
+
+
+
+
+
+        const visible = cards().filter(c => !c.hidden).map(c => c.querySelector("b").textContent);
+
+
+
+
+
+
+
+
+
+        ok("plugins: search filters the list", visible.length >= 1 && visible.every(n => /petal/i.test(cards().find(c => c.querySelector("b").textContent === n).dataset.search)), visible.join(","));
+
+
+
+
+
+
+
+
+
+        search.value = "zzzz-nothing";
+
+
+
+
+
+
+
+
+
+        search.dispatchEvent(new sv.w.Event("input")); await sleep(20);
+
+
+
+
+
+
+
+
+
+        ok("plugins: says when nothing matches", cards().every(c => c.hidden) && sw.querySelector(".bt-no-match"));
+
+
+
+
+
+
+
+
+
+        search.value = "";
+
+
+
+
+
+
+
+
+
+        search.dispatchEvent(new sv.w.Event("input")); await sleep(20);
+
+
+
+
+
+
+
+
+
+        const petals = cards().find(c => c.querySelector("b").textContent === "Sakura Petals");
+
+
+
+
+
+
+
+
+
+        const settingsBox = petals.querySelector(".bt-plugin-settings");
+
+
+
+
+
+
+
+
+
+        ok("plugins: settings folded away by default", settingsBox && settingsBox.hidden);
+
+
+
+
+
+
+
+
+
+        [...petals.querySelectorAll(".bt-b")].find(b => b.textContent === "Settings").click(); await sleep(10);
+
+
+
+
+
+
+
+
+
+        ok("plugins: Settings button unfolds them", !petals.querySelector(".bt-plugin-settings").hidden);
+
+
+
+
+
+
+
+
+
+        ok("plugins: count shown", /\d+ plugins · \d+ on/.test(sw.querySelector(".bt-plugin-count").textContent));
+
+
+
+
+
+
+
+
+
+        const fxCard = () => cards().find(c => c.querySelector("b").textContent === "Screen Effects");
+
+
+
+
+
+
+
+
+
+        ok("plugins: a plugin that's off says so inside its settings", fxCard().querySelector(".bt-plugin-off-note") && /is off/.test(fxCard().querySelector(".bt-plugin-off-note").textContent));
+
+
+
+
+
+
+
+
+
+        [...fxCard().querySelectorAll(".bt-plugin-off-note .bt-b")].find(b => b.textContent === "Turn it on").click();
+
+
+
+
+
+
+
+
+
+        await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("plugins: its Turn it on button starts it", SB.plugins.list().find(p => p.id === "screenEffects").running && !fxCard().querySelector(".bt-plugin-off-note") && fxCard().querySelector(".bt-switch").checked);
+
+
+
+
+
+
+
+
+
+        SB.plugins.disable("screenEffects");
+
+
+
+
+
+
+
+
+
+        SB.open("theme"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        const scrub = sw.querySelector('input[data-k="gradIntensity"]').closest(".bt-row").querySelector(".bt-scrub");
+
+
+
+
+
+
+
+
+
+        const ME = (type, x, extra = {}) => new sv.w.MouseEvent(type, { bubbles: true, clientX: x, button: 0, ...extra });
+
+
+
+
+
+
+
+
+
+        const startI = SB.settings.gradIntensity;
+
+
+
+
+
+
+
+
+
+        ok("values: shown as a scrubbable number", scrub && scrub.textContent === `${startI}%` && scrub.getAttribute("role") === "spinbutton");
+
+
+
+
+
+
+
+
+
+        scrub.dispatchEvent(ME("pointerdown", 100)); scrub.dispatchEvent(ME("pointermove", 120)); scrub.dispatchEvent(ME("pointerup", 120)); await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("values: dragging right raises it", SB.settings.gradIntensity === startI + 10 && scrub.textContent === `${startI + 10}%`, String(SB.settings.gradIntensity));
+
+
+
+
+
+
+
+
+
+        scrub.dispatchEvent(new sv.w.KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true })); await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("values: Shift+arrow nudges by 10", SB.settings.gradIntensity === startI);
+
+
+
+
+
+
+
+
+
+        scrub.dispatchEvent(ME("pointerdown", 50)); scrub.dispatchEvent(ME("pointerup", 50));
+
+
+
+
+
+
+
+
+
+        ok("values: a click lets you type", scrub.getAttribute("contenteditable") === "true");
+
+
+
+
+
+
+
+
+
+        scrub.textContent = "500";
+
+
+
+
+
+
+
+
+
+        scrub.dispatchEvent(new sv.w.KeyboardEvent("keydown", { key: "Enter", bubbles: true })); await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("values: typed value is kept within range", SB.settings.gradIntensity === 200 && scrub.textContent === "200%" && !scrub.hasAttribute("contenteditable"));
+
+
+
+
+
+
+
+
+
+        ok("values: change reaches the theme", svVar("--bt-grad-alpha") === "100%" && svVar("--bt-grad-size") === "76%");
+
+
+
+
+
+
+
+
+
+        scrub.dispatchEvent(ME("pointerdown", 50)); scrub.dispatchEvent(ME("pointerup", 50));
+
+
+
+
+
+
+
+
+
+        scrub.dispatchEvent(new sv.w.KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await sleep(10);
+
+
+
+
+
+
+
+
+
+        ok("values: Escape cancels typing without closing the window", sv.w.document.getElementById("bt-window") && !scrub.hasAttribute("contenteditable") && SB.settings.gradIntensity === 200);
+
+
+
+
+
+
+
+
+
+        SB.settings.gradIntensity = startI;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const gradHead = [...sw.querySelectorAll(".bt-sec-head")].find(h => h.textContent === "Gradient");
+
+
+
+
+
+
+
+
+
+        gradHead.click();
+
+
+
+
+
+
+
+
+
+        ok("sections: twirl closes a section", gradHead.closest(".bt-sec").classList.contains("bt-collapsed") && SB.settings.uiCollapsed["theme:Gradient"] === true);
+
+
+
+
+
+
+
+
+
+        SB.open("theme"); await sleep(30);
+
+
+
+
+
+
+
+
+
+        sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        const gradSec = () => [...sw.querySelectorAll(".bt-sec-head")].find(h => h.textContent === "Gradient").closest(".bt-sec");
+
+
+
+
+
+
+
+
+
+        ok("sections: stays closed next time", gradSec().classList.contains("bt-collapsed"));
+
+
+
+
+
+
+
+
+
+        gradSec().querySelector(".bt-sec-head").click();
+
+
+
+
+
+
+
+
+
+        ok("sections: opens again", !gradSec().classList.contains("bt-collapsed") && !SB.settings.uiCollapsed["theme:Gradient"]);
+
+
+
+
+
+
+
+
+
+        ok("presets: tiles, current one marked", sw.querySelectorAll(".bt-presets .bt-preset").length === 15);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        if (V.featureOn("themes")) {
+
+
+
+
+
+            const heads = () => [...sw.querySelectorAll(".bt-sec-head")].map(h => h.textContent);
+
+
+
+
+
+
+
+
+
+            ok("Discord Theme page: your look, with its own on/off and theme files", heads().join("|") === "Discord Theme|Colour presets|Wallpaper|Gradient|Glass panels|Role colours|Colours, font and shape|Messages|Voice|Theme files" && sw.querySelector('input[data-k="__theme"]') && sw.querySelector('input[data-k="__glass"]') && sw.querySelector(".bt-themes-list"), heads().join("|"));
+
+
+
+
+
+
+
+
+
+            const themeSw = sw.querySelector('input[data-k="__theme"]');
+
+
+
+
+
+
+
+
+
+            themeSw.checked = false;
+
+
+
+
+
+
+
+
+
+            themeSw.dispatchEvent(new sv.w.Event("change")); await sleep(30);
+
+
+
+
+
+
+
+
+
+            const warnEl = sw.querySelector(".bt-warn");
+
+
+
+
+
+
+
+
+
+            await go("/channels/@me");
+
+
+
+
+
+
+
+
+
+            ok("Discord Theme page: says when your theme is off", warnEl && !warnEl.hidden);
+
+
+
+
+
+
+
+
+
+            [...warnEl.querySelectorAll(".bt-b")].find(b => b.textContent === "Turn my theme on").click(); await sleep(30);
+
+
+
+
+
+
+
+
+
+            ok("Discord Theme page: its button turns your theme back on", SB.settings.enabledThemes.includes("b-themer.theme.css") && warnEl.hidden && themeSw.checked);
+
+
+
+
+
+
+
+
+
+            await go("/channels/111/222");
+
+
+
+
+
+
+
+
+
+            SB.open("servers"); await sleep(30);
+
+
+
+
+
+
+
+
+
+            sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+            ok("Server Theme page: only the server looks", sw.querySelector(".bt-servers") && !sw.querySelector('input[data-k="gradEnabled"]') && !sw.querySelector(".bt-themes-list"));
+
+
+
+
+
+
+
+
+
+            ok("Be Themer page: switches, shortcuts and advanced only", (SB.open("general"), (sw = sv.w.document.getElementById("bt-window")), heads().join("|") === "On and off|Shortcuts|Advanced"), heads().join("|"));
+
+
+
+
+
+
+
+
+
+            SB.open("themes"); await sleep(30);
+
+
+
+
+
+
+
+
+
+            sw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+            ok("open(\"themes\") (the old name) shows the Discord Theme page", sw.querySelector(".bt-tab-active").dataset.page === "theme");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            ok("settings have descriptions", sw.querySelector('input[data-k="gradEnabled"]').closest(".bt-row").querySelector(".bt-row-desc"));
+
+
+
+
+
+
+
+
+
+            ok("no placeholder wording in the settings", !/fairy|story|moonlit|magic|tale\b|glow script/i.test(sw.textContent), (sw.textContent.match(/.{20}(fairy|story|moonlit|magic|tale\b|glow script).{20}/i) || [])[0]);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            SB.toggle(); await sleep(30);
+
+
+
+
+
+
+
+
+
+            ok("everything off: warning shown again", !sw.querySelector(".bt-off-warn").hidden);
+
+
+
+
+
+
+
+
+
+            sw.querySelector(".bt-off-warn button").click(); await sleep(30);
+
+
+
+
+
+
+
+
+
+            {
+
+
+
+
+
+
+
+
+
+                SB.open("theme"); await sleep(30);
+
+
+
+
+
+
+
+
+
+                const tw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+                ok("theme page: no hand-made section list in the page (Discord's sidebar lists the sections)", !tw.querySelector(".bt-jump") && tw.querySelectorAll(".bt-page-theme .bt-sec-head").length > 5);
+
+
+
+
+
+
+
+
+
+                tw.remove();
+
+
+
+
+
+
+
+
+
+            }
+
+
+
+
+
+
+
+
+
+            ok("everything off: its button turns it back on", offWarn().hidden && SB.settings.enabled === true && svText().includes("--bt-theme-loaded") && svVar("--bt-accent") === "#4fc3f7");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            {
+
+
+
+
+
+
+
+
+
+                SB.open("maker"); await sleep(40);
+
+
+
+
+
+
+
+
+
+                const mw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+                const start = mw.querySelector(".bt-maker-start");
+
+
+
+
+
+
+
+
+
+                ok("maker: a Theme Maker page with a node canvas, templates and the add-node list", mw.querySelector(".bt-page-maker .bt-nodes") && [...start.options].some(o => o.value === "__starter") && [...start.options].some(o => o.value === "Ocean") && [...mw.querySelectorAll(".bt-maker-add option")].some(o => o.value === "harmony"));
+
+
+
+
+
+
+
+
+
+                start.value = "Ocean"; start.dispatchEvent(new sv.w.Event("change")); await sleep(30);
+
+
+
+
+
+
+
+
+
+                let t = SB.settings.customThemes["My Ocean"];
+
+
+
+
+
+
+
+
+
+                ok("maker: a preset becomes a graph (a Color node per colour → Theme Output) with the same colours", t && t.graph.nodes.filter(n => n.type === "color").length === 8 && t.graph.nodes.some(n => n.type === "output") && t.values.accent === "#4fc3f7" && t.values.gradBase === "#071a2c" && mw.querySelectorAll(".bt-node").length === 9, JSON.stringify(t && t.values));
+
+
+
+
+
+
+
+
+
+                const accentLink = t.graph.links.find(l => l.in === "accent");
+
+
+
+
+
+
+
+
+
+                const accentNode = mw.querySelector(`.bt-node[data-id="${accentLink.from}"] input[type="color"]`);
+
+
+
+
+
+
+
+
+
+                accentNode.value = "#ff0000"; accentNode.dispatchEvent(new sv.w.Event("input")); await sleep(20);
+
+
+
+
+
+
+
+
+
+                t = SB.settings.customThemes["My Ocean"];
+
+
+
+
+
+
+
+
+
+                ok("maker: editing a node recomputes and saves the theme", t.values.accent === "#ff0000");
+
+
+
+
+
+
+
+
+
+                [...mw.querySelectorAll(".bt-b")].find(b => b.textContent === "Apply to me").click(); await sleep(20);
+
+
+
+
+
+
+
+
+
+                ok("maker: Apply to me sets my colours", SB.settings.accent === "#ff0000" && SB.settings.makerApplied === "My Ocean" && SB.settings.gradBase === "#071a2c");
+
+
+
+
+
+
+
+
+
+                accentNode.value = "#00ff00"; accentNode.dispatchEvent(new sv.w.Event("input")); await sleep(20);
+
+
+
+
+
+
+
+
+
+                ok("maker: an applied theme updates live as you edit", SB.settings.accent === "#00ff00");
+
+
+
+
+
+
+
+
+
+                SB.settings.serverThemes[111].preset = "My Ocean";
+
+
+
+
+
+
+
+
+
+                SB.settings.serverThemes[111].accent = undefined;
+
+
+
+
+
+
+
+
+
+                delete SB.settings.serverThemes[111].accent;
+
+
+
+
+
+
+
+
+
+                await go("/channels/222/1"); await go("/channels/111/222"); await sleep(30);
+
+
+
+
+
+
+
+
+
+                ok("maker: a theme you made works as a server's look", svVar("--bt-accent") === "#00ff00", svVar("--bt-accent"));
+
+
+
+
+
+
+
+
+
+                start.value = "__starter"; start.dispatchEvent(new sv.w.Event("change")); await sleep(30);
+
+
+
+
+
+
+
+
+
+                const starter = SB.settings.customThemes["My theme"];
+
+
+
+
+
+
+
+
+
+                ok("maker: the starter derives every colour from one (Harmony node)", starter && starter.graph.nodes.some(n => n.type === "harmony") && starter.values.accent === "#ff5fa2" && starter.values.grad3 !== starter.values.grad1 && /^#[0-9a-f]{6}$/.test(starter.values.grad3));
+
+
+
+
+
+
+
+
+
+                mw.remove();
+
+
+
+
+
+
+
+
+
+                SB.open("theme"); await sleep(30);
+
+
+
+
+
+
+
+
+
+                const tw2 = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+                ok("maker: your themes are in the Colour presets", [...tw2.querySelectorAll(".bt-presets .bt-preset")].some(b => b.textContent === "My Ocean"));
+
+
+
+
+
+
+
+
+
+                tw2.remove();
+
+
+
+
+
+
+
+
+
+                delete SB.settings.makerApplied;
+
+
+
+
+
+
+
+
+
+            }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        }
+
+
+
+
+
+        {
+
+
+
+
+
+
+
+
+
+            const opened = [];
+
+
+
+
+
+
+
+
+
+            sv.w.BThemerNative.openExternal = url => (opened.push(url), Promise.resolve(true));
+
+
+
+
+
+
+
+
+
+            SB.open("general"); await sleep(30);
+
+
+
+
+
+
+
+
+
+            const gw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+            const gh = gw.querySelector(".bt-page-general .bt-gh");
+
+
+
+
+
+
+
+
+
+            ok("github: a round crystal button at the very top of the Be Themer page", gh && gw.querySelector(".bt-page-general").firstElementChild.classList.contains("bt-gh-wrap") && gh.querySelector("svg.bt-gh-crystal polygon") && gw.querySelector(".bt-gh-label").textContent === "GitHub");
+
+
+
+
+
+
+
+
+
+            gh.click(); await sleep(10);
+
+
+
+
+
+
+
+
+
+            ok("github: opens the repository (from package.json)", opened.length === 1 && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(opened[0]), opened.join());
+
+
+
+
+
+
+
+
+
+            gw.remove();
+
+
+
+
+
+
+
+
+
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        {
+
+
+
+
+
+
+
+
+
+            const root = sv.w.document.documentElement;
+
+
+
+
+
+
+
+
+
+            ok("notifications: follow your theme by default (badges, the NEW line, the new-messages bar)", SB.settings.notifAccent !== false && !root.hasAttribute("data-bt-notif") && svText().includes("html:not([data-bt-notif=\"discord\"]) [class*=\"numberBadge_\"]") && svText().includes("--divider-color: var(--bt-accent)"));
+
+
+
+
+
+
+
+
+
+            SB.open("theme"); await sleep(30);
+
+
+
+
+
+
+
+
+
+            const nw = sv.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+            const sw2 = nw.querySelector("[data-k=\"notifAccent\"]");
+
+
+
+
+
+
+
+
+
+            sw2.click(); await sleep(40);
+
+
+
+
+
+
+
+
+
+            ok("notifications: switched off, Discord's red is left alone", root.getAttribute("data-bt-notif") === "discord", JSON.stringify({ attr: root.getAttribute("data-bt-notif"), setting: SB.settings.notifAccent, checked: sw2.checked, hover: root.getAttribute("data-bt-hover"), enabled: SB.settings.enabled }));
+
+
+
+
+
+
+
+
+
+            sw2.click(); await sleep(40);
+
+
+
+
+
+
+
+
+
+            ok("notifications: back on follows your accent again", !root.hasAttribute("data-bt-notif"));
+
+
+
+
+
+
+
+
+
+            nw.remove();
+
+
+
+
+
+
+
+
+
+        }
+
+
+
+
+
+
+
+
+
+        ok("chat: the NEW line and date lines get their own gap (never through a message)", svText().includes("ol[data-list-id=\"chat-messages\"] > [class*=\"divider_\"]"));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    }
+
+
+    {
+
+
+
+
+
+
+
+
+
+        let applied = 0;
+
+
+
+
+
+
+
+
+
+        const replace = Sheet.prototype.replaceSync;
+
+
+
+
+
+
+
+
+
+        Sheet.prototype.replaceSync = function (t) { applied++; return replace.call(this, t); };
+
+
+
+
+
+
+
+
+
+        w.eval(`BThemer.definePlugin({ id: "perfProbe", enabledByDefault: true, start(api) { window.__perfSheet = api.css("a { color: red; }"); } })`);
+
+
+
+
+
+
+
+
+
+        await sleep(30);
+
+
+
+
+
+
+
+
+
+        const probe = w.__perfSheet;
+
+
+
+
+
+
+
+
+
+        const before = applied;
+
+
+
+
+
+
+
+
+
+        for (let i = 0; i < 5; i++) probe.update("a { color: red; }");
+
+
+
+
+
+
+
+
+
+        const same = applied - before;
+
+
+
+
+
+
+
+
+
+        probe.update("a { color: blue; }");
+
+
+
+
+
+
+
+
+
+        ok("perf: the same CSS isn't re-applied; changed CSS is", probe && same === 0 && applied - before === 1, `same: ${same}, changed: ${applied - before - same}`);
+
+
+
+
+
+
+
+
+
+        Sheet.prototype.replaceSync = replace;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const pw = makeWindow(`<!doctype html><html><body><nav class="guilds_x"></nav></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: {} });
+
+
+
+
+
+
+
+
+
+        let bodyWatchers = 0;
+
+
+
+
+
+
+
+
+
+        const observe = pw.w.MutationObserver.prototype.observe;
+
+
+
+
+
+
+
+
+
+        pw.w.MutationObserver.prototype.observe = function (t, o) { if (t === pw.w.document.body && o && o.subtree) bodyWatchers++; return observe.call(this, t, o); };
+
+
+
+
+
+
+
+
+
+        await sleep(20);
+
+
+
+
+
+
+
+
+
+        pw.w.eval(renderer); await sleep(120);
+
+
+
+
+
+
+
+
+
+        const seen = [];
+
+
+
+
+
+
+
+
+
+        pw.w.BThemer.definePlugin({ id: "perfObserve", enabledByDefault: true, start(api) { api.observe(".perf-x", el => seen.push(el.id)); } });
+
+
+
+
+
+
+
+
+
+        await sleep(30);
+
+
+
+
+
+
+
+
+
+        pw.w.document.body.insertAdjacentHTML("beforeend", '<div><span class="perf-x" id="px1"></span></div>');
+
+
+
+
+
+
+
+
+
+        await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("perf: the core, menus and plugins' observe() share one page watcher (and observe still works)", bodyWatchers === 1 && seen.join() === "px1", `watchers: ${bodyWatchers}, seen: ${seen}`);
+
+
+
+
+
+
+
+
+
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if (V.featureOn("splash")) {
+
+
+
+
+        const LOADING = '<div class="loadingWrap_x"><div class="container_x"><video data-testid="app-spinner" class="ready_x"></video><div class="tipTitle_x">Did you know</div><div class="tip_x">Discord tip</div></div></div>';
+
+
+
+
+
+
+
+
+
+        const sp = makeWindow(`<!doctype html><html><body><div id="app-mount">${LOADING}</div></body></html>`,
+
+
+
+
+
+
+
+
+
+            { version: "t", dataDir: "", quickCss: "", themes: [{ file: "b-themer.theme.css", source: "bundled", css: theme, name: "B" }], settings: { accent: "#ff1493", splashText: "Hello there | Second line" } });
+
+
+
+
+
+
+
+
+
+        await sleep(20);
+
+
+
+
+
+
+
+
+
+        sp.w.eval(renderer); await sleep(60);
+    ok("fresh install: My theme starts off", !sheetsTextOf(sp.w).includes("--bt-theme-loaded"));
+
+
+
+
+
+
+
+
+
+        const splashEl = () => sp.w.document.getElementById("bt-splash");
+
+
+
+
+
+
+
+
+
+        const host = () => sp.w.document.querySelector(".loadingWrap_x");
+
+
+
+
+
+
+
+
+
+        const el0 = splashEl();
+
+
+
+
+
+
+
+
+
+        ok("splash: in place of Discord's loading screen (inside it, not over the app)", el0 && el0.parentElement === host() && host().hasAttribute("data-bt-splash-host") && el0.dataset.style === "clyde");
+
+
+
+
+
+
+
+
+
+        for (let k = 0; k < 3; k++) { sp.w.document.body.append(sp.w.document.createElement("span")); await sleep(40); }
+
+
+
+
+
+
+
+
+
+        ok("splash: stays put (no hopping between Discord's wrappers)", splashEl() === el0 && el0.parentElement === host() && sp.w.document.querySelectorAll("[data-bt-splash-host]").length === 1);
+
+
+
+
+
+
+
+
+
+        ok("splash: Discord's spinner and tips are hidden while ours is there", sheetsTextOf(sp.w).includes("[data-bt-splash-host] > :not(#bt-splash) { visibility: hidden !important; }"));
+
+
+
+
+
+
+
+
+
+        const css = sheetsTextOf(sp.w);
+
+
+
+
+
+
+
+
+
+        ok("splash: no wordmark, no generic bar, ribbons or sparkles", !el0.querySelector(".bt-sp-word, .bt-sp-title, .bt-sp-bar, .bt-sp-ribbons, .bt-sp-sparks, .bt-lg") && !/Be Themer/.test(el0.textContent));
+
+
+
+
+
+
+
+
+
+        ok("splash: the Discord logo screen by default (no motion video any more)", el0.querySelector(".bt-k-clyde .bt-k-logo svg path") && !el0.querySelector("video, .bt-sp-logo-wrap"));
+
+
+
+
+
+
+
+
+
+        ok("splash: still shown when the OS asks for less motion (just standing still)", /@media \(prefers-reduced-motion: reduce\) \{\s*#bt-splash \*, #bt-splash \{ animation: none !important; \}/.test(css));
+
+
+
+
+
+
+
+
+
+        ok("splash: Discord's own loading screen stays solid (not see-through over the app)", el0.style.getPropertyValue("--sp-a") === "#ff1493" && css.includes("[data-bt-discord-loading] { background-color: var(--bt-grad-base, #111214) !important;"));
+
+
+
+
+
+
+
+
+
+        ok("splash: your own text, quietly under the logo", el0.querySelector(".bt-k .bt-k-caption").textContent === "Hello there");
+
+
+
+
+
+
+
+
+
+        await sleep(2950);
+
+
+
+
+
+
+
+
+
+        ok("splash: your lines take turns", el0.querySelector(".bt-k-caption").textContent === "Second line");
+
+
+
+
+
+
+
+
+
+        host().remove();
+
+
+
+
+
+
+
+
+
+        const nav = sp.w.document.createElement("nav");
+
+
+
+
+
+
+
+
+
+        nav.className = "guilds_x";
+
+
+
+
+
+
+
+
+
+        sp.w.document.getElementById("app-mount").append(nav);
+
+
+
+
+
+
+
+
+
+        await sleep(80);
+
+
+
+
+
+
+
+
+
+        ok("splash: gone the moment Discord's loading screen is (no extra time, nothing left over the app)", !splashEl() && !sp.w.document.documentElement.hasAttribute("data-bt-loading"));
+
+
+
+
+
+
+
+
+
+        sp.w.document.getElementById("app-mount").insertAdjacentHTML("beforeend", LOADING);
+
+
+
+
+
+
+
+
+
+        await sleep(80);
+
+
+
+
+
+
+
+
+
+        ok("splash: back when Discord shows its loading screen again (reconnecting)", splashEl() && splashEl().parentElement === host(), JSON.stringify({ splash: !!splashEl(), parent: splashEl() && splashEl().parentElement.className, spinner: !!sp.w.document.querySelector("video[data-testid=app-spinner]"), mount: sp.w.document.getElementById("app-mount").innerHTML.slice(0, 160) }));
+
+
+
+
+
+
+
+
+
+        host().remove();
+
+
+
+
+
+
+
+
+
+        await sleep(80);
+
+
+
+
+
+
+
+
+
+        ok("splash: and gone again with it", !splashEl());
+
+
+
+
+
+
+
+
+
+        sp.w.BThemer.open("splash"); await sleep(40);
+
+
+
+
+
+
+
+
+
+        const spWin = sp.w.document.getElementById("bt-window");
+
+
+
+
+
+
+
+
+
+        ok("splash page: ten loading screens to choose from", [...spWin.querySelectorAll('select[data-k="splashStyle"] option')].map(o => o.value).join("|") === "clyde|morph|minimal|terminal|equalizer|shapes|counter|wallpaper|media|discord");
+
+
+
+
+
+
+
+
+
+        ok("splash page: every setting is there (no more ribbons / sparkles / logo animation)", ["splashStyle", "splashText", "splashLogo", "splashFit", "splashDim", "splashBg", "splashFg", "splashAccent", "splashSize", "splashSpeed", "splashClydeAnim", "splashClydeLook", "splashLoader"].every(k => spWin.querySelector(`[data-k="${k}"]`)) && !["splashMin", "splashLogoAnim", "splashRibbons", "splashSparkles"].some(k => spWin.querySelector(`[data-k="${k}"]`)));
+
+
+
+
+
+
+
+
+
+        await sleep(10);
+
+
+
+
+
+
+
+
+
+        const rowShown = k => !spWin.querySelector(`[data-k="${k}"]`).closest(".bt-row").hidden;
+
+
+
+
+
+
+
+
+
+        ok("splash page: only the settings for the chosen screen show (Discord logo: its own, no picture options)", rowShown("splashText") && rowShown("splashBg") && rowShown("splashClydeAnim") && !rowShown("splashLogo") && !rowShown("splashSpinner") && !rowShown("splashBars"));
+
+
+
+
+
+
+
+
+
+        const styleSel = spWin.querySelector('select[data-k="splashStyle"]');
+
+
+
+
+
+
+
+
+
+        styleSel.value = "clyde"; styleSel.dispatchEvent(new sp.w.Event("change"));
+
+
+
+
+
+
+
+
+
+        ok("splash page: Discord logo shows its colours, size, speed, animation, look and loader", ["splashBg", "splashFg", "splashAccent", "splashSize", "splashSpeed", "splashClydeAnim", "splashClydeLook", "splashLoader"].every(rowShown) && !rowShown("splashLogo") && !rowShown("splashFit"));
+
+
+
+
+
+
+
+
+
+        styleSel.value = "clyde"; styleSel.dispatchEvent(new sp.w.Event("change"));
+
+
+
+
+
+
+
+
+
+        const splashCss = (t => t.slice(t.indexOf("/* splash: Be Themer's loading screen */"), t.indexOf("/* toasts */")))(sheetsTextOf(sp.w));
+
+
+
+
+
+
+
+
+
+        ok("splash: no gradients anywhere in the loading screens", splashCss.length > 2000 && !/gradient\(/.test(splashCss) && !splashCss.includes("bt-sp-blob"));
+
+
+
+
+
+
+
+
+
+        Object.assign(sp.w.BThemer.settings, { splashText: "" });
+
+
+
+
+
+
+
+
+
+        [...spWin.querySelectorAll(".bt-b")].find(b => b.textContent === "Preview").click(); await sleep(30);
+
+
+
+
+
+
+
+
+
+        ok("splash page: Preview shows it now", splashEl() && /Preview/.test(splashEl().querySelector(".bt-sp-skip").textContent));
+
+
+
+
+
+
+
+
+
+        ok("splash: no text unless you write some", !splashEl().querySelector(".bt-sp-text"));
+
+
+
+
+
+
+
+
+
+        splashEl().click(); await sleep(600);
+
+
+
+
+
+
+
+
+
+        ok("splash: a click closes the preview", !splashEl());
+
+
+
+
+
+
+
+
+
+        const previewKind = async (settings, wait = 30) => {
+
+
+
+
+
+
+
+
+
+            Object.assign(sp.w.BThemer.settings, settings);
+
+
+
+
+
+
+
+
+
+            [...spWin.querySelectorAll(".bt-b")].find(b => b.textContent === "Preview").click();
+
+
+
+
+
+
+
+
+
+            await sleep(wait);
+
+
+
+
+
+
+
+
+
+            return splashEl();
+
+
+
+
+
+
+
+
+
+        };
+
+
+
+
+
+
+
+
+
+        const closePreview = async () => { splashEl()?.click(); await sleep(600); };
+
+
+
+
+
+
+
+
+
+        let k = await previewKind({ splashStyle: "clyde", splashBg: "#000000", splashFg: "#ffcc00", splashAccent: "#00ff88", splashSize: 150, splashSpeed: 200, splashClydeAnim: "bounce", splashClydeLook: "outline", splashLoader: "dots" });
+
+
+
+
+
+
+
+
+
+        ok("splash: Discord logo, in your colours, size and speed", k && k.dataset.style === "clyde" && k.style.getPropertyValue("--sp-bg") === "#000000" && k.style.getPropertyValue("--sp-fg") === "#ffcc00" && k.style.getPropertyValue("--sp-accent") === "#00ff88" && k.style.getPropertyValue("--sp-scale") === "1.5" && k.style.getPropertyValue("--sp-k") === "2" && k.querySelector('.bt-k-logo[data-anim="bounce"][data-look="outline"] svg path') && k.querySelectorAll(".bt-k-dots i").length === 3 && !k.querySelector(".bt-sp-video, .bt-sp-logo-wrap"));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashLoader: "bar", splashClydeAnim: "flip" });
+
+
+
+
+
+
+
+
+
+        ok("splash: Discord logo with a loading bar, flipping", k.querySelector('.bt-k-logo[data-anim="flip"]') && k.querySelector(".bt-k-bar i") && sheetsTextOf(sp.w).includes("@keyframes bt-k-flip"));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashLoader: "ring" });
+
+
+
+
+
+
+
+
+
+        ok("splash: Discord logo with a spinner", k.querySelector("svg.bt-k-spin .bt-k-arc"));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "morph", splashMorphStay: true }, 120);
+
+
+
+
+
+
+
+
+
+        ok("splash: Shapes into Discord logo (or just the logo where SVG geometry is missing)", k.dataset.style === "morph" && k.querySelector(".bt-k-morph .bt-k-morph-svg path") && sheetsTextOf(sp.w).includes(".bt-k-morph-svg {"));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "minimal" });
+
+
+
+
+
+
+
+
+
+        ok("splash: Minimal spinner", k.dataset.style === "minimal" && k.querySelector(".bt-k-minimal svg.bt-k-spin .bt-k-track") && !k.querySelector(".bt-k-logo"));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "terminal", splashSpeed: 300 }, 2200);
+
+
+
+
+
+
+
+
+
+        const termText = k.querySelector(".bt-k-term").textContent;
+
+
+
+
+
+
+
+
+
+        ok("splash: Terminal types its boot log in a window, with timestamps and real numbers", /be-themer t/.test(termText) && /\[\s+\d\.\d{3}\] \[ ok \] themes\s+\d+ on/.test(termText) && /plugins\s+\d+ enabled/.test(termText) && k.querySelector(".bt-k-win .bt-k-winbar") && k.querySelector('.bt-k-term[data-cursor="block"] .bt-k-cursor'), termText);
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "terminal", splashTermLines: "booting the ship | loading crew | launching", splashTermWindow: false, splashTermTimes: false, splashTermCursor: "bar" }, 2200);
+
+
+
+
+
+
+
+
+
+        const ownTerm = k.querySelector(".bt-k-term").textContent;
+
+
+
+
+
+
+
+
+
+        ok("splash: Terminal with your own lines, no frame, no timestamps, bar cursor", /\[ ok \] booting the ship/.test(ownTerm) && /\[ \.\. \] launching/.test(ownTerm) && !/\d\.\d{3}\]/.test(ownTerm) && !k.querySelector(".bt-k-winbar") && k.querySelector('.bt-k-term[data-cursor="bar"]'), ownTerm);
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "equalizer", splashSpeed: 100 });
+
+
+
+
+
+
+
+
+
+        ok("splash: Equalizer bars, each on its own beat", k.querySelectorAll(".bt-k-eq i").length === 7 && k.querySelector(".bt-k-eq i:nth-child(2)").style.getPropertyValue("--d") === "0.50s" && k.querySelector('.bt-k-eq[data-grow="centre"][data-colors="alternate"]'));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashBars: 16, splashBarWidth: 4, splashBarRound: 0, splashEqColors: "second", splashEqMirror: false });
+
+
+
+
+
+
+
+
+
+        ok("splash: Equalizer: bar count, width, roundness, colours, grows up", k.querySelectorAll(".bt-k-eq i").length === 16 && k.querySelector(".bt-k-eq").style.getPropertyValue("--bw") === "4px" && k.querySelector(".bt-k-eq").style.getPropertyValue("--br") === "0px" && k.querySelector('.bt-k-eq[data-grow="up"][data-colors="second"]'));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "shapes" });
+
+
+
+
+
+
+
+
+
+        ok("splash: Shapes (circle, square, triangle)", k.querySelectorAll('.bt-k-shapes[data-motion="hop"] i').length === 3 && sheetsTextOf(sp.w).includes("@keyframes bt-k-hop-turn"));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashShapesMotion: "morph" });
+
+
+
+
+
+
+
+
+
+        ok("splash: Shapes: one morphing shape", k.querySelectorAll('.bt-k-shapes[data-motion="morph"] i').length === 1 && sheetsTextOf(sp.w).includes("@keyframes bt-k-morph"));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "counter" }, 700);
+
+
+
+
+
+
+
+
+
+        const counted = +k.querySelector(".bt-k-num").firstChild.textContent;
+
+
+
+
+
+
+
+
+
+        ok("splash: Counter climbs (and never claims 100)", counted > 20 && counted < 100 && k.querySelector(".bt-k-line i").style.getPropertyValue("--p") === `${counted}%`, String(counted));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashCounterMode: "elapsed", splashCounterFont: "mono", splashCounterLine: false }, 400);
+
+
+
+
+
+
+
+
+
+        ok("splash: Counter: honest seconds elapsed, monospace, no line", /^0\.\d\d$/.test(k.querySelector(".bt-k-num").firstChild.textContent) && k.querySelector('.bt-k-num[data-font="mono"] small').textContent === "s" && !k.querySelector(".bt-k-line"));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "minimal", splashSpinner: "ticks", splashThickness: 3 });
+
+
+
+
+
+
+
+
+
+        ok("splash: Minimal: tick wheel, your thickness", k.querySelectorAll(".bt-k-wheel-ticks i").length === 12 && k.style.getPropertyValue("--sp-thick") === "3px");
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashSpinner: "squares" });
+
+
+
+
+
+
+
+
+
+        ok("splash: Minimal: two squares", k.querySelectorAll(".bt-k-squares i").length === 2);
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        k = await previewKind({ splashStyle: "clyde", splashLoader: "ripple", splashClydeLook: "duotone", splashText: "hold tight", splashTextSize: 12, splashTextOpacity: 40, splashPlace: "low", splashPattern: "dots", splashPatternOpacity: 10 });
+
+
+
+
+
+
+
+
+
+        const cap = k.querySelector(".bt-k .bt-k-caption");
+
+
+
+
+
+
+
+
+
+        ok("splash: your text sits quietly just under the logo", cap && cap.textContent === "hold tight" && cap.previousElementSibling === k.querySelector(".bt-k-stage") && !k.querySelector(".bt-sp-center .bt-sp-text") && k.style.getPropertyValue("--sp-ts") === "12px" && k.style.getPropertyValue("--sp-to") === "0.4");
+
+
+
+
+
+
+
+
+
+        ok("splash: position, flat pattern (SVG, not a gradient), ripples, two-colour logo", k.dataset.place === "low" && k.dataset.pattern === "dots" && /^url\("data:image\/svg\+xml,/.test(k.style.getPropertyValue("--sp-pattern")) && !/gradient/.test(k.style.getPropertyValue("--sp-pattern")) && k.querySelectorAll(".bt-k-ripple i").length === 2 && k.querySelector('.bt-k-logo[data-look="duotone"]'));
+
+
+
+
+
+
+
+
+
+        await closePreview();
+
+
+
+
+
+
+
+
+
+        Object.assign(sp.w.BThemer.settings, { splashStyle: "clyde", splashSpeed: 100, splashSize: 100, splashText: "", splashPlace: "center", splashPattern: "none" });
+
+
+
+
+
+
+
+
+
+        const old = makeWindow(`<!doctype html><html><body><div id="app-mount">${LOADING}</div></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: { splashStyle: "animated" } });
+
+
+
+
+
+
+
+
+
+        await sleep(20);
+
+
+
+
+
+
+
+
+
+        old.w.eval(renderer); await sleep(80);
+
+
+
+
+
+
+
+
+
+        ok("splash: an old motion-video setting becomes the Discord logo screen", old.w.BThemer.settings.splashStyle === "clyde" && old.w.document.querySelector("#bt-splash .bt-k-clyde") && !old.w.document.querySelector("#bt-splash video"));
+
+
+
+
+
+
+
+
+
+        const boot = makeWindow(`<!doctype html><html><body><div id="app-mount"></div></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: {} });
+
+
+
+
+
+
+
+
+
+        Object.defineProperty(boot.w.document, "readyState", { get: () => "loading", configurable: true });
+
+
+
+
+
+
+
+
+
+        boot.w.eval(renderer);
+
+
+
+
+
+
+
+
+
+        const bootEl = () => boot.w.document.getElementById("bt-splash");
+
+
+
+
+
+
+
+
+
+        ok("splash: up the moment Be Themer starts (before Discord's page has loaded), over everything", bootEl() && bootEl().parentElement === boot.w.document.documentElement && bootEl().dataset.style === "clyde" && boot.w.document.documentElement.hasAttribute("data-bt-loading") && boot.w.document.adoptedStyleSheets.length > 0);
+
+
+
+
+
+
+
+
+
+        delete boot.w.document.readyState;
+
+
+
+
+
+
+
+
+
+        boot.w.document.dispatchEvent(new boot.w.Event("DOMContentLoaded"));
+
+
+
+
+
+
+
+
+
+        await sleep(40);
+
+
+
+
+
+
+
+
+
+        boot.w.document.getElementById("app-mount").insertAdjacentHTML("beforeend", LOADING); await sleep(60);
+
+
+
+
+
+
+
+
+
+        ok("splash: stays up while Discord shows its own loading screen (no second splash)", bootEl() && bootEl().parentElement === boot.w.document.documentElement && boot.w.document.querySelectorAll("#bt-splash").length === 1);
+
+
+
+
+
+
+
+
+
+        boot.w.document.querySelector(".loadingWrap_x").remove();
+
+
+
+
+
+
+
+
+
+        const bootNav = boot.w.document.createElement("nav");
+
+
+
+
+
+
+
+
+
+        bootNav.className = "guilds_x";
+
+
+
+
+
+
+
+
+
+        boot.w.document.getElementById("app-mount").append(bootNav);
+
+
+
+
+
+
+
+
+
+        await sleep(60);
+
+
+
+
+
+
+
+
+
+        ok("splash: fades out once Discord's app is on screen", bootEl() && bootEl().classList.contains("bt-out"));
+
+
+
+
+
+
+
+
+
+        await sleep(600);
+
+
+
+
+
+
+
+
+
+        ok("splash: and is gone", !bootEl());
+
+
+
+
+
+
+
+
+
+        const none1 = makeWindow(`<!doctype html><html><body><div id="app-mount">${LOADING}</div></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: { splashStyle: "discord" } });
+
+
+
+
+
+
+
+
+
+        none1.w.eval(renderer); await sleep(40);
+
+
+
+
+
+
+
+
+
+        const none2 = makeWindow(`<!doctype html><html><body><div id="app-mount">${LOADING}</div></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: { enabled: false } });
+
+
+
+
+
+
+
+
+
+        none2.w.eval(renderer); await sleep(40);
+
+
+
+
+
+
+
+
+
+        ok("splash: Discord's own screen with Discord's own, or while Be Themer is off", !none1.w.document.getElementById("bt-splash") && !none2.w.document.getElementById("bt-splash") && !none1.w.document.querySelector("[data-bt-splash-host]"));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        const m = makeWindow(`<!doctype html><html><body></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: { petals: false, petalCount: 50, hideNitro: true } });
+
+
+
+
+
+
+
+
+
+        m.w.eval(renderer); await sleep(80);
+
+
+
+
+
+
+
+
+
+        const l2 = Object.fromEntries(m.w.BThemer.plugins.list().map(p => [p.id, p]));
+
+
+
+
+
+
+
+
+
+        ok("v1.0 settings migrated", (!V.hasPlugin("sakuraPetals") || !l2.sakuraPetals.running) && (!V.hasPlugin("hideNitro") || l2.hideNitro.running) && m.w.BThemer.settings.plugins.sakuraPetals.settings.count === 50 && !("petals" in m.w.BThemer.settings));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    }
+
+
+
+
+    const p = makeWindow(`<!doctype html><html><body></body></html>`, { version: "t", dataDir: "", quickCss: "", themes: [], settings: {} });
+
+
+
+
+
+
+
+
+
+    p.w.eval(renderer);
+
+
+
+
+
+
+
+
+
+    p.w.eval(`
+
+
+
+
+
+
+
+
+
+      (() => {
+
+
+
+
+
+
+
+
+
+        const modules = {}, cache = {};
+
+
+
+
+
+
+
+
+
+        const req = id => { if (cache[id]) return cache[id].exports; const m = (cache[id] = { exports: {} }); modules[id].call(m.exports, m, m.exports, req); return m.exports; };
+
+
+
+
+
+
+
+
+
+        const jsonp = (parent, data) => { for (const k in data[1]) modules[k] = data[1][k]; if (parent) parent(data); };
+
+
+
+
+
+
+
+
+
+        const g = (self.webpackChunkdiscord_app = self.webpackChunkdiscord_app || []);
+
+
+
+
+
+
+
+
+
+        g.forEach(jsonp.bind(null, 0));
+
+
+
+
+
+
+
+
+
+        g.push = jsonp.bind(null, g.push.bind(g));
+
+
+
+
+
+
+
+
+
+        window.__req = req;
+
+
+
+
+
+
+
+
+
+      })();
+
+
+
+
+
+
+
+
+
+      (self.webpackChunkdiscord_app = self.webpackChunkdiscord_app || []).push([[1], {
+
+
+
+
+
+
+
+
+
+        9: function (e) { e.exports = { createElement: () => null, useEffect: () => {}, useRef: () => ({}) }; }, /* a React look-alike without Component/version: must be ignored */
+
+
+
+
+
+
+
+
+
+        10: function (e) { e.exports = { version: "18.3.1", Component: class {}, createElement: (t, p, ...c) => ({ t, p, c }), useEffect: () => {}, useRef: () => ({ current: null }) }; },
+
+
+
+
+
+
+
+
+
+        11: function (e, t) { Object.defineProperty(t, "Z", { enumerable: true, get: () => ({ SECTION: 41, SIDEBAR_ITEM: 42, PANEL: 43, CATEGORY: 45, CUSTOM: 49 }) }); },
+
+
+
+
+
+
+
+
+
+        12: (e, t, n) => { const root = { key: "$Root", buildLayout: () => [{ key: "user_section" }, { key: "x" }, { key: "billing_section" }] }; e.exports = { layout: () => root.buildLayout().map(s => s) }; },
+
+
+
+
+
+
+
+
+
+      }]);
+
+
+
+
+
+
+
+
+
+    `);
+
+
+
+
+
+
+
+
+
+    p.w.__req(9); p.w.__req(10); p.w.__req(11);
+
+
+
+
+
+
+
+
+
+    const layout = p.w.__req(12).layout();
+
+
+
+
+
+
+
+
+
+    const keys = layout.map(n => n.key);
+
+
+
+
+
+
+
+
+
+    ok("webpack: settings module patched", p.w.BThemer.debug().patchesApplied.includes("settings section"), JSON.stringify(p.w.BThemer.debug()));
+
+
+
+
+
+
+
+
+
+    ok("webpack: React + layout types picked up", p.w.BThemer.debug().reactFound && p.w.BThemer.debug().layoutTypesFound);
+
+
+
+
+
+
+
+
+
+    ok("webpack: Be Themer section above billing", keys.join(",") === "user_section,x,bthemer_section,billing_section", keys.join(","));
+
+
+
+
+
+
+
+
+
+    const section = layout[2];
+
+
+
+
+
+
+
+
+
+    const entries = section.buildLayout();
+
+
+
+
+
+
+
+
+
+    ok("webpack: section uses Discord's real type ids", section.type === 41 && entries.every(e => e.type === 42) && section.useTitle() === TITLES[0]);
+
+
+
+
+
+
+
+
+
+    const logoIcon = entries[0].icon();
+
+
+
+
+
+
+
+
+
+    ok("webpack: the Be Themer entry shows the app logo", logoIcon.t === "img" && /^data:image\/png;base64,/.test(logoIcon.p.src) && logoIcon.p.width === 20);
+
+
+
+
+
+
+
+
+
+    ok("webpack: other entries keep their icons", entries[1].icon().t === "svg");
+
+
+
+
+
+
+
+
+
+    ok("webpack: one entry per page", entries.map(e => e.useTitle()).join(",") === TITLES.join(","), entries.map(e => e.useTitle()).join(","));
+
+
+
+
+
+
+
+
+
+    const custom = entries[1].buildLayout()[0].buildLayout()[0].buildLayout()[0];
+
+
+
+
+
+
+
+
+
+    ok("webpack: page component is wired", custom.type === 49 && typeof custom.Component === "function" && (c => (c.p && c.p.className === "bt-native") || (typeof c.t === "function" && c.c[0] && c.c[0].p.className === "bt-native"))(custom.Component()));
+
+
+
+
+
+
+
+
+
+    {
+
+
+
+
+
+
+
+
+
+        if (V.featureOn("themes")) {
+
+            const themePanel = entries.find(e => e.useTitle() === "Discord Theme").buildLayout()[0];
+
+
+
+
+
+
+
+
+
+            const cats = themePanel.buildLayout();
+
+
+
+
+
+
+
+
+
+            const titled = cats.filter(c => typeof c.useTitle === "function").map(c => c.useTitle());
+
+
+
+
+
+
+
+
+
+            ok("webpack: Discord Theme's sections are Discord categories (listed under it in the sidebar, like Account's)", cats.every(c => c.type === cats[0].type) && typeof cats[0].useTitle !== "function" && titled.join(" | ") === "Colour presets | Wallpaper | Gradient | Glass panels | Role colours | Colours, font and shape | Messages | Voice | Theme files", titled.join(" | "));
+
+
+
+
+
+
+
+
+
+            const wallCat = cats.find(c => c.useTitle && c.useTitle() === "Wallpaper");
+
+
+
+
+
+
+
+
+
+            const comp = wallCat.buildLayout()[0].Component();
+
+
+
+
+
+
+
+
+
+            const node = comp.p && comp.p.className === "bt-native" ? comp : comp.c[0];
+
+
+
+
+
+
+
+
+
+            const host = p.w.document.createElement("div");
+
+
+
+
+
+
+
+
+
+            node.p.ref(host);
+
+
+
+
+
+
+
+
+
+            const secs = host.querySelectorAll(".bt-sec");
+
+
+
+
+
+
+
+
+
+            ok("webpack: a section's category shows only that section", secs.length === 1 && !host.querySelector(".bt-sec-head") && host.textContent.includes("Your own picture behind Discord") && !host.querySelector(".bt-off-warn"), host.innerHTML.slice(0, 200));
+
+
+
+
+
+
+
+
+
+            const headComp = cats[0].buildLayout()[0].Component();
+
+
+
+
+
+
+
+
+
+            const headNode = headComp.p && headComp.p.className === "bt-native" ? headComp : headComp.c[0];
+
+
+
+
+
+
+
+
+
+            const headHost = p.w.document.createElement("div");
+
+
+
+
+
+
+
+
+
+            headNode.p.ref(headHost);
+
+
+
+
+
+
+
+
+
+            ok("webpack: the top of Discord Theme keeps its switch and notices", headHost.querySelector(".bt-off-warn") && headHost.querySelectorAll(".bt-sec").length === 1 && !headHost.textContent.includes("Your own picture behind Discord"));
+
+
+
+
+
+
+
+
+
+        }
+
+        const pluginsPanel = entries.find(e => e.useTitle() === "Plugins").buildLayout()[0];
+
+
+
+
+
+
+
+
+
+        ok("webpack: other pages stay one category", pluginsPanel.buildLayout().length === 1);
+
+
+
+
+
+
+
+
+
+    }
+
+
+
+
+
+
+
+
+
+    ok("webpack: layout not duplicated on rebuild", p.w.__req(12).layout().filter(n => n.key === "bthemer_section").length === 1);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    console.log(results.join("\n"));
+
+
+
+
+
+
+
+
+
+    console.log(`\n${results.filter(r => r.startsWith("PASS")).length}/${results.length} passed`);
+
+
+
+
+
+
+
+
+
+    process.exit(results.some(r => r.startsWith("FAIL")) ? 1 : 0);
+
+
+
+
+
+
+
+
+
+})().catch(e => { console.log(results.join("\n")); console.error(e); process.exit(1); });
+
+
+
+
+
+
+
+
+

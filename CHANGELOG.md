@@ -3,6 +3,11 @@
 All notable changes to Be Themer are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [2.2.2] - 2026-11-16
+
+### Changed
+- **My theme** now starts off on a new install; turn it on from the General page or the Discord Theme page. Existing settings are kept.
+
 ## [2.2.1] - 2026-11-15
 
 ### Fixed

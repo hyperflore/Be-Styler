@@ -29,7 +29,7 @@
         bubbles: false, hoverEffect: "glow", notifAccent: true,
         roleStyle: "off", roleSpeed: 4,
         soundboardRing: "#ff5fa2",
-        enabledThemes: [MAIN_THEME], userPlugins: true,
+        enabledThemes: [], userPlugins: true,
         serverThemesEnabled: true,
         splashStyle: "clyde", splashText: "", splashLogo: true, splashFit: "cover", splashDim: 25, splashMediaName: "",
         splashBg: "#111214", splashFg: "#ffffff", splashAccent: "#5865f2", splashSize: 100, splashSpeed: 100,
