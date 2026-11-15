@@ -75,6 +75,7 @@ contextBridge.exposeInMainWorld("BThemerNative", {
         return () => ipcRenderer.removeListener("BT_LAZY_EVENT", fn);
     },
     ytChannelVideos: (ids, shorts) => ipcRenderer.invoke("BT_YT_CHANNEL_VIDEOS", ids, !!shorts),
+    ytSegments: videoId => ipcRenderer.invoke("BT_YT_SEGMENTS", String(videoId || "")),
     openExternal: url => ipcRenderer.invoke("BT_OPEN_EXTERNAL", String(url)),
     reloadPlugins: () => loadUserPlugins(),
     recDefaultDir: () => ipcRenderer.invoke("BT_REC_DEFAULT_DIR"),

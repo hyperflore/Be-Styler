@@ -769,6 +769,29 @@ const ytChannelFeed = async id => {
     }
     return { id, name, videos };
 };
+const SPONSOR_CATEGORIES = ["sponsor", "intro", "outro", "music_offtopic", "selfpromo", "preview"];
+const sponsorCache = new Map();
+ipcMain.handle("BT_YT_SEGMENTS", async (e, videoId) => {
+    if (!isHooked(e)) throw new Error("Not allowed");
+    const id = String(videoId || "");
+    if (!/^[\w-]{11}$/.test(id)) return [];
+    const hit = sponsorCache.get(id);
+    if (hit && Date.now() < hit.expiresAt) return hit.segments;
+    const url = `https://sponsor.ajay.app/api/skipSegments?videoID=${encodeURIComponent(id)}&categories=${encodeURIComponent(JSON.stringify(SPONSOR_CATEGORIES))}`;
+    const res = await fetch(url, { headers: { "User-Agent": "BeThemer" }, signal: AbortSignal.timeout(4000) }).catch(() => null);
+    if (!res) return [];
+    let segments = [];
+    if (res.status === 200) {
+        const list = await res.json().catch(() => []);
+        segments = (Array.isArray(list) ? list : [])
+            .filter(s => s && s.actionType === "skip" && Array.isArray(s.segment) && s.segment.length === 2)
+            .map(s => ({ category: String(s.category), start: Number(s.segment[0]), end: Number(s.segment[1]) }))
+            .filter(s => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start);
+    } else if (res.status !== 404) return [];
+    if (sponsorCache.size > 500) for (const [k, v] of sponsorCache) if (Date.now() > v.expiresAt) sponsorCache.delete(k);
+    sponsorCache.set(id, { segments, expiresAt: Date.now() + 2 * 3600_000 });
+    return segments;
+});
 ipcMain.handle("BT_YT_RESOLVE_CHANNEL", async (e, raw) => {
     if (!isHooked(e)) throw new Error("Not allowed");
     let text = String(raw || "").trim();

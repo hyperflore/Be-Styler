@@ -3,6 +3,11 @@
 All notable changes to Be Themer are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] - 2026-11-15
+
+### Fixed
+- The installer and the GitHub button in settings pointed at the old `hyperflor` account instead of `hyperflore`.
+
 ## [2.2.0] - 2026-11-14
 
 ### Added

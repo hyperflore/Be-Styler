@@ -2418,6 +2418,7 @@ html[data-bt-inline] [role="tab"][aria-selected="true"]:not(.bt-settings-tab) {
                 search: q => Native.ytSearch(q),
                 resolveChannel: text => Native.ytResolveChannel(text),
                 channelVideos: (ids, includeShorts) => Native.ytChannelVideos(ids, includeShorts),
+                segments: videoId => Native.ytSegments(videoId),
             }),
             openWindow: (title, content) => openContentWindow(title, content),
             setSetting(key, value) {
@@ -4497,6 +4498,14 @@ html[data-bt-inline] [role="tab"][aria-selected="true"]:not(.bt-settings-tab) {
         themeSwitch() {
             const frag = document.createDocumentFragment();
             const sw = switchRow;
+            const everything = () => sw("everything", "Be Themer", () => enabled, on => {
+                if (on !== enabled) toggle();
+            }, featureOn("themes") ? "Everything: themes, custom CSS and plugins. Shortcut: Ctrl+Alt+A." : "Everything: all plugins. Shortcut: Ctrl+Alt+A.");
+            // Builds without themes (Be-Core, Be-Func) have nothing for the theme switches to control.
+            if (!featureOn("themes")) {
+                frag.append(everything());
+                return frag;
+            }
             const here = $("div", { className: "bt-here-look" });
             renderHereLook(here);
             frag.append(
@@ -4516,9 +4525,7 @@ html[data-bt-inline] [role="tab"][aria-selected="true"]:not(.bt-settings-tab) {
                     update();
                     refreshControls();
                 }, "See-through, blurred panels. Off makes them solid."),
-                sw("everything", "Be Themer", () => enabled, on => {
-                    if (on !== enabled) toggle();
-                }, "Everything: themes, custom CSS and plugins. Shortcut: Ctrl+Alt+A."),
+                everything(),
             );
             return frag;
         },

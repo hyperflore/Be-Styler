@@ -62,6 +62,7 @@ BThemer.definePlugin({
         includeShorts: { type: "toggle", label: "Show Shorts in Subscriptions", default: false },
         showVideo: { type: "toggle", label: "Show the video (off = audio-only bar, keeps playing)", default: true },
         rememberLast: { type: "toggle", label: "Reopen the last video after restarting Discord", default: true },
+        skipSponsors: { type: "toggle", label: "Skip sponsor segments (SponsorBlock: sponsors, intros, outros, self-promo)", default: true },
     },
     css: `
         .bt-yt { position: relative; padding: 10px 10px 8px; border-bottom: 1px solid var(--background-modifier-accent, rgb(78 80 88 / .48));
@@ -274,8 +275,22 @@ BThemer.definePlugin({
             try { frame?.contentWindow?.postMessage(JSON.stringify({ event: "command", func, args }), "*"); } catch {}
         };
         const liveTime = () => state.time + (state.playing ? (Date.now() - state.at) / 1000 : 0);
+        let segments = [], lastSkip = -1;
+        function skipSponsor(t) {
+            const seg = segments.find(s => t >= s.start && t < s.end - 0.5 && s.start !== lastSkip);
+            if (!seg) return;
+            lastSkip = seg.start;
+            post("seekTo", [seg.end, true]);
+            api.toast(`Skipped a ${seg.category.replace(/_/g, " ")} segment`, 2500);
+        }
         function loadVideo(v, autoplay = true) {
             current = v;
+            segments = [];
+            lastSkip = -1;
+            if (v?.id && api.settings.skipSponsors !== false) {
+                const id = v.id;
+                api.youtube.segments(id).then(list => { if (current?.id === id) segments = list || []; }).catch(() => {});
+            }
             state = { ...state, playing: false, time: 0, duration: 0, at: Date.now(), inList: !!v?.list };
             frame?.remove();
             frame = null;
@@ -312,7 +327,10 @@ BThemer.definePlugin({
             const info = data?.info;
             if (!info || typeof info !== "object") return;
             if (typeof info.playerState === "number") state.playing = info.playerState === 1;
-            if (typeof info.currentTime === "number") { state.time = info.currentTime; state.at = Date.now(); }
+            if (typeof info.currentTime === "number") {
+                state.time = info.currentTime; state.at = Date.now();
+                if (segments.length && api.settings.skipSponsors !== false) skipSponsor(info.currentTime);
+            }
             if (typeof info.duration === "number" && info.duration > 0) state.duration = info.duration;
             if (typeof info.volume === "number" && !volDragging && Date.now() - volSetAt > 1500) state.volume = info.volume;
             if (typeof info.muted === "boolean" && Date.now() - volSetAt > 1500) state.muted = info.muted;
