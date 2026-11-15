@@ -42,11 +42,18 @@ jobs:
           $notes | Set-Content -Encoding utf8 release-notes.md
 
       - name: Publish the release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >
-          gh release create "${{ github.ref_name }}"
-          release/Be-Styler.exe release/Be-Styler-Cli.exe release/dist.zip release/SHA256SUMS.txt
-          --title "Be-Styler ${{ github.ref_name }}"
-          --notes-file release-notes.md
-          --latest
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $assets = "release/Be-Styler.exe release/Be-Styler-Cli.exe release/dist.zip release/SHA256SUMS.txt" -split ' '
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # Release was already created (e.g. by hand) — refresh its assets and notes instead of failing.
+            gh release upload $tag @assets --clobber
+            gh release edit $tag --title "Be-Styler ${{ github.ref_name }}" --notes-file release-notes.md --latest
+          } else {
+            gh release create $tag @assets --title "Be-Styler ${{ github.ref_name }}" --notes-file release-notes.md --latest
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
