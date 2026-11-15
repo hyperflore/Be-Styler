@@ -1,0 +1,47 @@
+{
+    "name": "be-styler",
+    "version": "2.2.0",
+    "description": "Be Styler: the Be Themer theme engine plus the theme-effect plugins. No Meow or Owlie.",
+    "private": true,
+    "license": "MIT",
+    "author": "hyperflore",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/hyperflore/Be-Styler.git"
+    },
+    "homepage": "https://github.com/hyperflore/Be-Styler",
+    "bugs": {
+        "url": "https://github.com/hyperflore/Be-Styler/issues"
+    },
+    "keywords": [
+        "discord",
+        "client-mod",
+        "themes",
+        "plugins",
+        "electron"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "scripts": {
+        "build": "node scripts/build.mjs",
+        "build:installer": "node scripts/build-installer.mjs",
+        "build:adblock": "node scripts/build-adblock.mjs",
+        "dev": "node scripts/build.mjs --watch",
+        "check": "node scripts/build.mjs --check && node --check injector/index.js",
+        "new-plugin": "node scripts/new-plugin.mjs",
+        "inject": "node scripts/build.mjs && node injector/index.js",
+        "inject:ptb": "node scripts/build.mjs && node injector/index.js --branch=ptb",
+        "inject:canary": "node scripts/build.mjs && node injector/index.js --branch=canary",
+        "inject:all": "node scripts/build.mjs && node injector/index.js --branch=all",
+        "uninject": "node injector/index.js --uninject",
+        "uninject:all": "node injector/index.js --uninject --branch=all",
+        "status": "node injector/index.js --status",
+        "test": "node tests/run.mjs"
+    },
+    "devDependencies": {
+        "@ghostery/adblocker-electron": "^2.20.3",
+        "esbuild": "^0.28.2",
+        "jsdom": "^24.1.3"
+    }
+}

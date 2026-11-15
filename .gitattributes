@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.cs text eol=crlf
+*.manifest text eol=crlf
+
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary

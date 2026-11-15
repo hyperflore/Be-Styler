@@ -1,0 +1,36 @@
+name: Bug report
+description: Something in Be Themer doesn't work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Be Themer version
+      description: Shown in User Settings → Be Themer.
+    validations:
+      required: true
+  - type: dropdown
+    id: branch
+    attributes:
+      label: Discord branch
+      options: [Stable, PTB, Canary]
+    validations:
+      required: true
+  - type: input
+    id: plugins
+    attributes:
+      label: Plugins involved
+      description: Which plugin(s), if any. Does it still happen with all other plugins off?
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors from DevTools
+      description: Press Ctrl+Shift+I, open the Console tab, and paste any red errors.
+      render: text

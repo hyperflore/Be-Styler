@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build:installer
+
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($version))\]" | Select-Object -First 1).LineNumber
+          if ($start) {
+            $rest = $lines[$start..($lines.Count - 1)]
+            $end = ($rest | Select-String -Pattern "^## \[" | Select-Object -First 1).LineNumber
+            $notes = if ($end) { $rest[0..($end - 2)] } else { $rest }
+          } else {
+            $notes = @("See CHANGELOG.md.")
+          }
+          $notes += ""
+          $notes += "**Install:** download Be-Styler.exe below and run it."
+          $notes += "Checksums are in ``SHA256SUMS.txt``."
+          $notes | Set-Content -Encoding utf8 release-notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          release/Be-Styler.exe release/Be-Styler-Cli.exe release/dist.zip release/SHA256SUMS.txt
+          --title "Be-Styler ${{ github.ref_name }}"
+          --notes-file release-notes.md
+          --latest
